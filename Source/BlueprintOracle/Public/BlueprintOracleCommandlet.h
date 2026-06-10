@@ -9,6 +9,8 @@
 class UBlueprint;
 class UEdGraph;
 class UPackage;
+class UUserDefinedStruct;
+class UUserDefinedEnum;
 
 /**
  * BlueprintOracle. For each requested Blueprint asset, emits four ground-truth artifacts to a chosen
@@ -54,4 +56,10 @@ private:
 
 	/** Dump Kismet bytecode disassembly for every UFunction in the generated class. */
 	void WriteDisasm(UBlueprint* Blueprint, const FString& OutPath);
+
+	/** Dump a UserDefinedStruct's fields (name + cpp type + referenced type). */
+	void WriteStruct(UUserDefinedStruct* Struct, const FString& OutPath);
+
+	/** Dump a UserDefinedEnum's entries (authored name, display name, value). */
+	void WriteEnum(UUserDefinedEnum* Enum, const FString& OutPath);
 };

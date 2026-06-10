@@ -3,6 +3,8 @@
 #include "BlueprintOracleCommandlet.h"
 
 #include "Engine/Blueprint.h"
+#include "StructUtils/UserDefinedStruct.h"
+#include "Engine/UserDefinedEnum.h"
 #include "Engine/SimpleConstructionScript.h"
 #include "Engine/SCS_Node.h"
 #include "EdGraph/EdGraph.h"
@@ -219,7 +221,23 @@ void UBlueprintOracleCommandlet::ProcessAsset(const FString& PackageName, const 
 
 	if (!Blueprint)
 	{
-		UE_LOG(LogBlueprintOracle, Warning, TEXT("%s is not a Blueprint; wrote layout only."), *PackageName);
+		// Not a Blueprint - try UserDefinedStruct / UserDefinedEnum (item data models).
+		TArray<UObject*> Objects;
+		GetObjectsWithOuter(Package, Objects, /*bIncludeNestedObjects*/ false);
+		for (UObject* Obj : Objects)
+		{
+			if (UUserDefinedStruct* Struct = Cast<UUserDefinedStruct>(Obj))
+			{
+				WriteStruct(Struct, OutDir / AssetName + TEXT(".struct.json"));
+				return;
+			}
+			if (UUserDefinedEnum* Enum = Cast<UUserDefinedEnum>(Obj))
+			{
+				WriteEnum(Enum, OutDir / AssetName + TEXT(".enum.json"));
+				return;
+			}
+		}
+		UE_LOG(LogBlueprintOracle, Warning, TEXT("%s is not a Blueprint/Struct/Enum; wrote layout only."), *PackageName);
 		return;
 	}
 
@@ -465,4 +483,77 @@ void UBlueprintOracleCommandlet::WriteDisasm(UBlueprint* Blueprint, const FStrin
 
 	FFileHelper::SaveStringToFile(static_cast<const FString&>(Out), *OutPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
 	UE_LOG(LogBlueprintOracle, Display, TEXT("  wrote disasm.txt"));
+}
+
+void UBlueprintOracleCommandlet::WriteStruct(UUserDefinedStruct* Struct, const FString& OutPath)
+{
+	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("name"), Struct->GetName());
+	Root->SetStringField(TEXT("kind"), TEXT("UserDefinedStruct"));
+
+	TArray<TSharedPtr<FJsonValue>> Fields;
+	for (TFieldIterator<FProperty> It(Struct); It; ++It)
+	{
+		FProperty* Property = *It;
+		TSharedRef<FJsonObject> F = MakeShared<FJsonObject>();
+		F->SetStringField(TEXT("name"), Property->GetAuthoredName());
+		F->SetStringField(TEXT("cppType"), Property->GetCPPType());
+		F->SetStringField(TEXT("propertyClass"), Property->GetClass()->GetName());
+		// For container/struct/enum/object properties, record the referenced type.
+		FString Inner;
+		if (const FStructProperty* SP = CastField<FStructProperty>(Property))
+		{
+			Inner = SP->Struct ? SP->Struct->GetName() : TEXT("");
+		}
+		else if (const FArrayProperty* AP = CastField<FArrayProperty>(Property))
+		{
+			Inner = AP->Inner ? AP->Inner->GetCPPType() : TEXT("");
+		}
+		else if (const FByteProperty* BP = CastField<FByteProperty>(Property))
+		{
+			Inner = BP->Enum ? BP->Enum->GetName() : TEXT("");
+		}
+		else if (const FEnumProperty* EP = CastField<FEnumProperty>(Property))
+		{
+			Inner = EP->GetEnum() ? EP->GetEnum()->GetName() : TEXT("");
+		}
+		if (!Inner.IsEmpty())
+		{
+			F->SetStringField(TEXT("innerType"), Inner);
+		}
+		Fields.Add(MakeShared<FJsonValueObject>(F));
+	}
+	Root->SetArrayField(TEXT("fields"), Fields);
+
+	SaveJson(Root, OutPath);
+	UE_LOG(LogBlueprintOracle, Display, TEXT("  wrote struct.json (%d fields)"), Fields.Num());
+}
+
+void UBlueprintOracleCommandlet::WriteEnum(UUserDefinedEnum* Enum, const FString& OutPath)
+{
+	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("name"), Enum->GetName());
+	Root->SetStringField(TEXT("kind"), TEXT("UserDefinedEnum"));
+
+	TArray<TSharedPtr<FJsonValue>> Entries;
+	// NumEnums() includes the implicit _MAX entry; skip it.
+	const int32 Num = Enum->NumEnums();
+	for (int32 i = 0; i < Num; ++i)
+	{
+		const FString Name = Enum->GetNameStringByIndex(i);
+		if (Name.EndsWith(TEXT("_MAX")))
+		{
+			continue;
+		}
+		TSharedRef<FJsonObject> E = MakeShared<FJsonObject>();
+		E->SetNumberField(TEXT("index"), i);
+		E->SetStringField(TEXT("name"), Name);  // authored name, e.g. "NewEnumerator7"
+		E->SetStringField(TEXT("displayName"), Enum->GetDisplayNameTextByIndex(i).ToString());
+		E->SetNumberField(TEXT("value"), (double)Enum->GetValueByIndex(i));
+		Entries.Add(MakeShared<FJsonValueObject>(E));
+	}
+	Root->SetArrayField(TEXT("entries"), Entries);
+
+	SaveJson(Root, OutPath);
+	UE_LOG(LogBlueprintOracle, Display, TEXT("  wrote enum.json (%d entries)"), Entries.Num());
 }

@@ -1,0 +1,24 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"FriendlyName": "BlueprintOracle",
+	"Description": "Editor commandlet that dumps ground-truth Blueprint data to JSON/text (graph nodes + pins + connectivity, linker layout, and Kismet bytecode disassembly) for static analysis, documentation, and agent-assisted Blueprint-to-C++ conversion.",
+	"Category": "Programming",
+	"CreatedBy": "getnamo",
+	"CreatedByURL": "http://getnamo.com",
+	"DocsURL": "https://github.com/getnamo/BlueprintOracle-Unreal",
+	"MarketplaceURL": "",
+	"SupportURL": "https://github.com/getnamo/BlueprintOracle-Unreal/issues",
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "BlueprintOracle",
+			"Type": "UncookedOnly",
+			"LoadingPhase": "Default"
+		}
+	]
+}

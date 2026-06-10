@@ -194,7 +194,11 @@ void UBlueprintOracleCommandlet::ProcessAsset(const FString& PackageName, const 
 	}
 	Package->FullyLoad();
 
-	const FString AssetName = FPackageName::GetShortName(PackageName);
+	// Use the full package path (with '/' -> '_') as the output filename so assets
+	// that share a short name (e.g. multiple "OrkKnight") don't overwrite each other.
+	FString AssetName = PackageName;
+	AssetName.RemoveFromStart(TEXT("/"));
+	AssetName.ReplaceInline(TEXT("/"), TEXT("_"));
 
 	// Layout works on any package; do it first while the linker is fresh.
 	WriteLayout(Package, OutDir / AssetName + TEXT(".layout.json"));

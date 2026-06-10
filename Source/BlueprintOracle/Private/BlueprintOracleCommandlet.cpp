@@ -18,6 +18,11 @@
 #include "K2Node_Variable.h"
 #include "K2Node_VariableGet.h"
 #include "K2Node_Event.h"
+#include "K2Node_BreakStruct.h"
+#include "K2Node_MakeStruct.h"
+#include "K2Node_CallDelegate.h"
+#include "K2Node_FunctionEntry.h"
+#include "K2Node_FunctionResult.h"
 
 // Write-side (programmatic blueprint editing) APIs.
 #include "Kismet2/KismetEditorUtilities.h"
@@ -662,6 +667,71 @@ namespace
 		return LoadObject<UClass>(nullptr, *Path);
 	}
 
+	UScriptStruct* ResolveStruct(const FString& Path)
+	{
+		if (Path.IsEmpty()) { return nullptr; }
+		if (UScriptStruct* Found = FindObject<UScriptStruct>(nullptr, *Path)) { return Found; }
+		return LoadObject<UScriptStruct>(nullptr, *Path);
+	}
+
+	// A UserDefinedStruct member pin is named "<Field>_<Index>_<32 hex GUID>". Return the
+	// authored "<Field>" so specs can reference clean field names instead of the GUID soup.
+	FString StripStructPinGuid(const FString& PinName)
+	{
+		int32 Last = INDEX_NONE;
+		if (!PinName.FindLastChar(TEXT('_'), Last)) { return PinName; }
+		const FString Tail = PinName.Mid(Last + 1);
+		bool bHex = Tail.Len() == 32;
+		for (int32 i = 0; bHex && i < Tail.Len(); ++i) { bHex = FChar::IsHexDigit(Tail[i]); }
+		if (!bHex) { return PinName; }
+		const FString Rest = PinName.Left(Last);             // "<Field>_<Index>"
+		int32 Last2 = INDEX_NONE;
+		if (!Rest.FindLastChar(TEXT('_'), Last2)) { return PinName; }
+		if (!Rest.Mid(Last2 + 1).IsNumeric()) { return PinName; }
+		return Rest.Left(Last2);                              // "<Field>"
+	}
+
+	// Resolve a "nodeRef:pinName" token (nodeRef in NodeMap, e.g. "$entry"/"$result"/an id)
+	// to a pin of the given direction. Logs the available pins if the name isn't found.
+	UEdGraphPin* ResolvePin(const TMap<FString, UEdGraphNode*>& NodeMap, const FString& Token,
+		EEdGraphPinDirection Dir)
+	{
+		FString Ref, PinName;
+		if (!Token.Split(TEXT(":"), &Ref, &PinName))
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("    buildBody: bad pin token '%s' (want nodeRef:pin)"), *Token);
+			return nullptr;
+		}
+		UEdGraphNode* const* Node = NodeMap.Find(Ref);
+		if (!Node || !*Node)
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("    buildBody: unknown node ref '%s'"), *Ref);
+			return nullptr;
+		}
+		if (UEdGraphPin* Pin = (*Node)->FindPin(FName(*PinName), Dir))
+		{
+			return Pin;
+		}
+		// Fallback: match a struct member pin by its authored field-name prefix.
+		for (UEdGraphPin* P : (*Node)->Pins)
+		{
+			if (P && P->Direction == Dir && StripStructPinGuid(P->PinName.ToString()) == PinName)
+			{
+				return P;
+			}
+		}
+		// Helpful diagnostics: dump the candidate pins for that direction.
+		FString Avail;
+		for (UEdGraphPin* P : (*Node)->Pins)
+		{
+			if (P && P->Direction == Dir) { Avail += P->PinName.ToString() + TEXT(", "); }
+		}
+		UE_LOG(LogBlueprintOracle, Error,
+			TEXT("    buildBody: pin '%s' (%s) not found on node '%s'. Available: [%s]"),
+			*PinName, Dir == EGPD_Output ? TEXT("out") : TEXT("in"), *Ref, *Avail);
+		return nullptr;
+	}
+
 	// Find a function graph (or any authored graph) on a blueprint by name.
 	UEdGraph* FindGraphByName(UBlueprint* Blueprint, const FString& Name)
 	{
@@ -854,6 +924,165 @@ bool UBlueprintOracleCommandlet::ApplyMigrationOp(UBlueprint* Blueprint, const T
 		UE_LOG(LogBlueprintOracle, Display, TEXT("    setCallPinDefault %s.%s = '%s' (%d node(s))"),
 			*Member, *PinName, *Value, Count);
 		return true;
+	}
+
+	if (OpName == TEXT("buildBody"))
+	{
+		// Replace a function graph's body. Keeps the FunctionEntry/Result, removes every
+		// other node, then builds the spec's nodes and links. A small graph-authoring
+		// engine: kinds = callFunction / breakStruct / makeStruct / callDelegate; node
+		// refs in links use "$entry"/"$result"/<id>; pins by "ref:pinName".
+		const FString GraphName = Op->GetStringField(TEXT("graph"));
+		UEdGraph* Graph = FindGraphByName(Blueprint, GraphName);
+		if (!Graph)
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("    buildBody: graph '%s' not found"), *GraphName);
+			return false;
+		}
+
+		UK2Node_FunctionEntry* Entry = nullptr;
+		UK2Node_FunctionResult* Result = nullptr;
+		for (UEdGraphNode* N : Graph->Nodes)
+		{
+			if (UK2Node_FunctionEntry* E = Cast<UK2Node_FunctionEntry>(N)) { Entry = E; }
+			if (UK2Node_FunctionResult* R = Cast<UK2Node_FunctionResult>(N)) { Result = R; }
+		}
+
+		// Strip the old body (everything but entry/result).
+		TArray<UEdGraphNode*> ToRemove;
+		for (UEdGraphNode* N : Graph->Nodes)
+		{
+			if (N && N != Entry && N != Result) { ToRemove.Add(N); }
+		}
+		for (UEdGraphNode* N : ToRemove)
+		{
+			FBlueprintEditorUtils::RemoveNode(Blueprint, N, /*bDontRecompile*/ true);
+		}
+
+		TMap<FString, UEdGraphNode*> NodeMap;
+		if (Entry) { NodeMap.Add(TEXT("$entry"), Entry); }
+		if (Result) { NodeMap.Add(TEXT("$result"), Result); }
+
+		UClass* SkelClass = Blueprint->SkeletonGeneratedClass ? Blueprint->SkeletonGeneratedClass : Blueprint->GeneratedClass;
+
+		const TArray<TSharedPtr<FJsonValue>>* NodeSpecs = nullptr;
+		Op->TryGetArrayField(TEXT("nodes"), NodeSpecs);
+		int32 PosY = 0;
+		if (NodeSpecs)
+		{
+			for (const TSharedPtr<FJsonValue>& NV : *NodeSpecs)
+			{
+				const TSharedPtr<FJsonObject> NObj = NV->AsObject();
+				if (!NObj.IsValid()) { continue; }
+				const FString Id = NObj->GetStringField(TEXT("id"));
+				const FString Kind = NObj->GetStringField(TEXT("kind"));
+				UEdGraphNode* Created = nullptr;
+
+				if (Kind == TEXT("callFunction"))
+				{
+					FGraphNodeCreator<UK2Node_CallFunction> C(*Graph);
+					UK2Node_CallFunction* Node = C.CreateNode();
+					const FString Member = NObj->GetStringField(TEXT("member"));
+					bool bSelf = false;
+					NObj->TryGetBoolField(TEXT("self"), bSelf);
+					if (bSelf)
+					{
+						Node->FunctionReference.SetSelfMember(FName(*Member));
+					}
+					else
+					{
+						UClass* Cls = ResolveClass(NObj->GetStringField(TEXT("class")));
+						Node->FunctionReference.SetExternalMember(FName(*Member), Cls);
+					}
+					Node->NodePosX = 300; Node->NodePosY = PosY;
+					C.Finalize();
+					Created = Node;
+				}
+				else if (Kind == TEXT("breakStruct") || Kind == TEXT("makeStruct"))
+				{
+					UScriptStruct* S = ResolveStruct(NObj->GetStringField(TEXT("struct")));
+					if (!S)
+					{
+						UE_LOG(LogBlueprintOracle, Error, TEXT("    buildBody: cannot resolve struct for node '%s'"), *Id);
+						return false;
+					}
+					if (Kind == TEXT("breakStruct"))
+					{
+						FGraphNodeCreator<UK2Node_BreakStruct> C(*Graph);
+						UK2Node_BreakStruct* Node = C.CreateNode();
+						Node->StructType = S;
+						Node->NodePosX = 150; Node->NodePosY = PosY;
+						C.Finalize();
+						Created = Node;
+					}
+					else
+					{
+						FGraphNodeCreator<UK2Node_MakeStruct> C(*Graph);
+						UK2Node_MakeStruct* Node = C.CreateNode();
+						Node->StructType = S;
+						Node->NodePosX = 450; Node->NodePosY = PosY;
+						C.Finalize();
+						Created = Node;
+					}
+				}
+				else if (Kind == TEXT("callDelegate"))
+				{
+					const FName DName(*NObj->GetStringField(TEXT("delegate")));
+					FMulticastDelegateProperty* DProp =
+						FindFProperty<FMulticastDelegateProperty>(SkelClass, DName);
+					FGraphNodeCreator<UK2Node_CallDelegate> C(*Graph);
+					UK2Node_CallDelegate* Node = C.CreateNode();
+					if (DProp)
+					{
+						Node->SetFromProperty(DProp, /*bSelfContext*/ true, SkelClass);
+					}
+					else
+					{
+						UE_LOG(LogBlueprintOracle, Warning, TEXT("    buildBody: delegate '%s' not found"), *DName.ToString());
+					}
+					Node->NodePosX = 600; Node->NodePosY = PosY;
+					C.Finalize();
+					Created = Node;
+				}
+				else
+				{
+					UE_LOG(LogBlueprintOracle, Error, TEXT("    buildBody: unknown node kind '%s'"), *Kind);
+					return false;
+				}
+
+				NodeMap.Add(Id, Created);
+				PosY += 200;
+			}
+		}
+
+		// Wire links.
+		int32 LinkOk = 0, LinkFail = 0;
+		const TArray<TSharedPtr<FJsonValue>>* LinkSpecs = nullptr;
+		Op->TryGetArrayField(TEXT("links"), LinkSpecs);
+		if (LinkSpecs)
+		{
+			for (const TSharedPtr<FJsonValue>& LV : *LinkSpecs)
+			{
+				const TSharedPtr<FJsonObject> LObj = LV->AsObject();
+				if (!LObj.IsValid()) { continue; }
+				UEdGraphPin* FromPin = ResolvePin(NodeMap, LObj->GetStringField(TEXT("from")), EGPD_Output);
+				UEdGraphPin* ToPin = ResolvePin(NodeMap, LObj->GetStringField(TEXT("to")), EGPD_Input);
+				if (FromPin && ToPin)
+				{
+					FromPin->MakeLinkTo(ToPin);
+					++LinkOk;
+				}
+				else
+				{
+					++LinkFail;
+				}
+			}
+		}
+
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+		UE_LOG(LogBlueprintOracle, Display, TEXT("    buildBody '%s': %d node(s), %d link(s) ok, %d failed"),
+			*GraphName, NodeMap.Num() - 2, LinkOk, LinkFail);
+		return LinkFail == 0;
 	}
 
 	UE_LOG(LogBlueprintOracle, Error, TEXT("    unknown op '%s'"), *OpName);

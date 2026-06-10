@@ -1050,6 +1050,35 @@ bool UBlueprintOracleCommandlet::ApplyMigrationOp(UBlueprint* Blueprint, const T
 					return false;
 				}
 
+				// Optional pin literal defaults: "defaults": [ {"pin": "...", "value": "..."} ].
+				const TArray<TSharedPtr<FJsonValue>>* Defaults = nullptr;
+				if (Created && NObj->TryGetArrayField(TEXT("defaults"), Defaults))
+				{
+					for (const TSharedPtr<FJsonValue>& DV : *Defaults)
+					{
+						const TSharedPtr<FJsonObject> DObj = DV->AsObject();
+						if (!DObj.IsValid()) { continue; }
+						const FString PinName = DObj->GetStringField(TEXT("pin"));
+						const FString Value = DObj->GetStringField(TEXT("value"));
+						if (UEdGraphPin* Pin = Created->FindPin(FName(*PinName), EGPD_Input))
+						{
+							if (const UEdGraphSchema* Schema = Pin->GetSchema())
+							{
+								Schema->TrySetDefaultValue(*Pin, Value);
+							}
+							else
+							{
+								Pin->DefaultValue = Value;
+							}
+						}
+						else
+						{
+							UE_LOG(LogBlueprintOracle, Warning,
+								TEXT("    buildBody: default pin '%s' not found on node '%s'"), *PinName, *Id);
+						}
+					}
+				}
+
 				NodeMap.Add(Id, Created);
 				PosY += 200;
 			}

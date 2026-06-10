@@ -1114,6 +1114,111 @@ bool UBlueprintOracleCommandlet::ApplyMigrationOp(UBlueprint* Blueprint, const T
 		return LinkFail == 0;
 	}
 
+	if (OpName == TEXT("spliceCall"))
+	{
+		// Move 2 (general converter splice): create a CallFunction node and use its output to
+		// DRIVE an existing input pin ("into"), replacing whatever currently feeds that pin; wire
+		// the new call's inputs from existing node pins. Existing nodes are identified by GUID
+		// (as emitted in graph.json), pins by name. Used to gate/transform a wire without
+		// rebuilding the whole graph (which buildBody would).
+		const FString GraphName = Op->GetStringField(TEXT("graph"));
+		UEdGraph* Graph = FindGraphByName(Blueprint, GraphName);
+		if (!Graph)
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("    spliceCall: graph '%s' not found"), *GraphName);
+			return false;
+		}
+
+		// GUID -> node map for this graph.
+		TMap<FString, UEdGraphNode*> ByGuid;
+		for (UEdGraphNode* N : Graph->Nodes)
+		{
+			if (N) { ByGuid.Add(N->NodeGuid.ToString(EGuidFormats::Digits), N); }
+		}
+		auto FindNode = [&ByGuid](const FString& Guid) -> UEdGraphNode*
+		{
+			UEdGraphNode* const* P = ByGuid.Find(Guid);
+			return P ? *P : nullptr;
+		};
+		// FindPin by name with the struct-member authored-prefix fallback (mirrors ResolvePin).
+		auto FindPinByName = [](UEdGraphNode* Node, const FString& PinName, EEdGraphPinDirection Dir) -> UEdGraphPin*
+		{
+			if (!Node) { return nullptr; }
+			if (UEdGraphPin* Pin = Node->FindPin(FName(*PinName), Dir)) { return Pin; }
+			for (UEdGraphPin* P : Node->Pins)
+			{
+				if (P && P->Direction == Dir && StripStructPinGuid(P->PinName.ToString()) == PinName) { return P; }
+			}
+			return nullptr;
+		};
+
+		// Create the call node.
+		FGraphNodeCreator<UK2Node_CallFunction> C(*Graph);
+		UK2Node_CallFunction* Call = C.CreateNode();
+		const FString Member = Op->GetStringField(TEXT("member"));
+		bool bSelf = false;
+		Op->TryGetBoolField(TEXT("self"), bSelf);
+		if (bSelf)
+		{
+			Call->FunctionReference.SetSelfMember(FName(*Member));
+		}
+		else
+		{
+			Call->FunctionReference.SetExternalMember(FName(*Member), ResolveClass(Op->GetStringField(TEXT("class"))));
+		}
+		C.Finalize();
+
+		FString OutPinName = TEXT("ReturnValue");
+		Op->TryGetStringField(TEXT("out"), OutPinName);
+		UEdGraphPin* OutPin = FindPinByName(Call, OutPinName, EGPD_Output);
+		if (!OutPin)
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("    spliceCall: function '%s' has no output pin '%s'"), *Member, *OutPinName);
+			return false;
+		}
+
+		// Drive the target input pin, breaking its current source link(s) first.
+		const TSharedPtr<FJsonObject> IntoObj = Op->GetObjectField(TEXT("into"));
+		UEdGraphNode* IntoNode = FindNode(IntoObj->GetStringField(TEXT("node")));
+		UEdGraphPin* IntoPin = FindPinByName(IntoNode, IntoObj->GetStringField(TEXT("pin")), EGPD_Input);
+		if (!IntoPin)
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("    spliceCall: 'into' pin '%s' not found on node '%s'"),
+				*IntoObj->GetStringField(TEXT("pin")), *IntoObj->GetStringField(TEXT("node")));
+			return false;
+		}
+		IntoPin->BreakAllPinLinks();
+		OutPin->MakeLinkTo(IntoPin);
+
+		// Wire the call's inputs from existing node output pins.
+		int32 InOk = 0, InFail = 0;
+		const TArray<TSharedPtr<FJsonValue>>* Inputs = nullptr;
+		if (Op->TryGetArrayField(TEXT("inputs"), Inputs))
+		{
+			for (const TSharedPtr<FJsonValue>& IV : *Inputs)
+			{
+				const TSharedPtr<FJsonObject> IObj = IV->AsObject();
+				if (!IObj.IsValid()) { continue; }
+				UEdGraphPin* DstPin = FindPinByName(Call, IObj->GetStringField(TEXT("pin")), EGPD_Input);
+				UEdGraphNode* SrcNode = FindNode(IObj->GetStringField(TEXT("node")));
+				UEdGraphPin* SrcPin = FindPinByName(SrcNode, IObj->GetStringField(TEXT("fromPin")), EGPD_Output);
+				if (DstPin && SrcPin) { SrcPin->MakeLinkTo(DstPin); ++InOk; }
+				else
+				{
+					++InFail;
+					UE_LOG(LogBlueprintOracle, Error, TEXT("    spliceCall: could not wire input '%s' (dst=%d src=%d)"),
+						*IObj->GetStringField(TEXT("pin")), DstPin != nullptr, SrcPin != nullptr);
+				}
+			}
+		}
+
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+		UE_LOG(LogBlueprintOracle, Display,
+			TEXT("    spliceCall '%s' -> %s.%s : %d input(s) wired, %d failed"),
+			*Member, *IntoObj->GetStringField(TEXT("node")), *IntoObj->GetStringField(TEXT("pin")), InOk, InFail);
+		return InFail == 0;
+	}
+
 	UE_LOG(LogBlueprintOracle, Error, TEXT("    unknown op '%s'"), *OpName);
 	return false;
 }

@@ -243,6 +243,7 @@ reports every asset's error/warning count without touching disk — always dry-r
 | `replaceVarRefs` | `from`, `to` | `ReplaceVariableReferences` (rename all use sites) | 4 |
 | `redirectCall` | `fromMember`, `toMember`, `toClass`, `graph?` | retarget every matching `CallFunction` + `ReconstructNode` (auto-rewire by pin name) | 1 |
 | `setCallPinDefault` | `member`, `pin`, `value`, `graph?` | reconstruct the call node, write a literal onto an input pin, **strip orphaned pins** | 2 (repair) |
+| `spliceCall` | `graph`, `member`, `self`/`class`, `out?`, `into`, `inputs[]` | create a `CallFunction` and use its output (`out`, default `ReturnValue`) to **drive an existing input pin** (`into` = `{node:<guid>, pin}`, breaking that pin's current source), wiring the new call's `inputs[]` (`{pin, node:<guid>, fromPin}`) from existing node output pins. Existing nodes are addressed by GUID (as emitted in `graph.json`), pins by name. Gates/transforms one wire without rebuilding the whole graph. | 2 (general) |
 
 `graph?` (optional) restricts an op to one named graph; omit to apply across all graphs of the asset.
 

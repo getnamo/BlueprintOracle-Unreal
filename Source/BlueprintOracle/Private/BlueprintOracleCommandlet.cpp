@@ -3,6 +3,7 @@
 #include "BlueprintOracleCommandlet.h"
 
 #include "Engine/Blueprint.h"
+#include "Engine/DataTable.h"
 #include "StructUtils/UserDefinedStruct.h"
 #include "Engine/UserDefinedEnum.h"
 #include "Engine/SimpleConstructionScript.h"
@@ -147,6 +148,52 @@ int32 UBlueprintOracleCommandlet::Main(const FString& Params)
 		}
 		IFileManager::Get().MakeDirectory(*OutDirSelf, /*Tree*/ true);
 		return RunSelfTest(OutDirSelf);
+	}
+
+	// -dumptable -asset=A,B : dump UDataTable(s) as JSON (row struct + row names + rows).
+	if (FParse::Param(*Params, TEXT("dumptable")))
+	{
+		FString TableArg;
+		FParse::Value(*Params, TEXT("asset="), TableArg, /*bShouldStopOnSeparator*/ false);
+		FString DumpOut;
+		FParse::Value(*Params, TEXT("out="), DumpOut);
+		if (DumpOut.IsEmpty())
+		{
+			DumpOut = FPaths::ProjectSavedDir() / TEXT("BlueprintOracle");
+		}
+		IFileManager::Get().MakeDirectory(*DumpOut, /*Tree*/ true);
+		TArray<FString> Tables;
+		TableArg.ParseIntoArray(Tables, TEXT(","), /*CullEmpty*/ true);
+		for (const FString& TablePkg : Tables)
+		{
+			UPackage* Pkg = LoadPackage(nullptr, *TablePkg.TrimStartAndEnd(), LOAD_None);
+			if (!Pkg) { UE_LOG(LogBlueprintOracle, Error, TEXT("Cannot load %s"), *TablePkg); continue; }
+			Pkg->FullyLoad();
+			TArray<UObject*> Objects;
+			GetObjectsWithOuter(Pkg, Objects, false);
+			FString Name = TablePkg; Name.RemoveFromStart(TEXT("/")); Name.ReplaceInline(TEXT("/"), TEXT("_"));
+			for (UObject* Obj : Objects)
+			{
+				if (UDataTable* Table = Cast<UDataTable>(Obj))
+				{
+					TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+					Root->SetStringField(TEXT("table"), Table->GetName());
+					Root->SetStringField(TEXT("rowStruct"), Table->GetRowStructPathName().ToString());
+					TArray<TSharedPtr<FJsonValue>> RowNames;
+					for (const FName& RowName : Table->GetRowNames())
+					{
+						RowNames.Add(MakeShared<FJsonValueString>(RowName.ToString()));
+					}
+					Root->SetArrayField(TEXT("rowNames"), RowNames);
+					Root->SetStringField(TEXT("rowsJson"), Table->GetTableAsJSON(EDataTableExportFlags::None));
+					SaveJson(Root, DumpOut / Name + TEXT(".table.json"));
+					UE_LOG(LogBlueprintOracle, Display, TEXT("  wrote table %s (%d rows)"),
+						*Table->GetName(), Table->GetRowNames().Num());
+					break;
+				}
+			}
+		}
+		return 0;
 	}
 
 	// -migrate -spec=<file.json> : apply a structural edit spec, compile-gated.

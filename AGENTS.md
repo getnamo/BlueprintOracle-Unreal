@@ -244,6 +244,9 @@ reports every asset's error/warning count without touching disk — always dry-r
 | `redirectCall` | `fromMember`, `toMember`, `toClass`, `graph?` | retarget every matching `CallFunction` + `ReconstructNode` (auto-rewire by pin name) | 1 |
 | `setCallPinDefault` | `member`, `pin`, `value`, `graph?` | reconstruct the call node, write a literal onto an input pin, **strip orphaned pins** | 2 (repair) |
 | `spliceCall` | `graph`, `member`, `self`/`class`, `out?`, `into`, `inputs[]` | create a `CallFunction` and use its output (`out`, default `ReturnValue`) to **drive an existing input pin** (`into` = `{node:<guid>, pin}`, breaking that pin's current source), wiring the new call's `inputs[]` (`{pin, node:<guid>, fromPin}`) from existing node output pins. Existing nodes are addressed by GUID (as emitted in `graph.json`), pins by name. Gates/transforms one wire without rebuilding the whole graph. | 2 (general) |
+| `addVar` | `name`, `category`, `struct?`/`class?`/`sub?`, `container?` | `AddMemberVariable` with a pin type built from the spec (category = bool/int/byte/real(+sub)/name/string/text/struct/object/class; `container` = Array/Set). | 4 |
+| `removeNode` | `graph`, `node` (guid) | remove a node from a graph (e.g. an orphaned `BreakStruct` after a `spliceCall` retarget). | — |
+| `retargetVarRef` | `graph`, `node` (guid), `toVar`, `toClass?` | point a `VariableGet`/`VariableSet` at a different member (`toClass` external, else self) + `ReconstructNode` so its value pin takes the new type. E.g. swap a read of a legacy array member for an inherited canonical one. | 4 |
 
 `graph?` (optional) restricts an op to one named graph; omit to apply across all graphs of the asset.
 

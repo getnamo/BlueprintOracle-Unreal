@@ -1219,6 +1219,111 @@ bool UBlueprintOracleCommandlet::ApplyMigrationOp(UBlueprint* Blueprint, const T
 		return InFail == 0;
 	}
 
+	if (OpName == TEXT("addVar"))
+	{
+		// Add a member variable. Build the pin type from {category, struct?/class?, container?}.
+		// category: bool/int/byte/real(+sub float/double)/name/string/text/struct/object/class/enum.
+		const FString VarName = Op->GetStringField(TEXT("name"));
+		const FString Category = Op->GetStringField(TEXT("category"));
+		FEdGraphPinType T;
+		if (Category == TEXT("struct"))
+		{
+			T.PinCategory = UEdGraphSchema_K2::PC_Struct;
+			T.PinSubCategoryObject = ResolveStruct(Op->GetStringField(TEXT("struct")));
+		}
+		else if (Category == TEXT("object"))
+		{
+			T.PinCategory = UEdGraphSchema_K2::PC_Object;
+			T.PinSubCategoryObject = ResolveClass(Op->GetStringField(TEXT("class")));
+		}
+		else if (Category == TEXT("class"))
+		{
+			T.PinCategory = UEdGraphSchema_K2::PC_Class;
+			T.PinSubCategoryObject = ResolveClass(Op->GetStringField(TEXT("class")));
+		}
+		else if (Category == TEXT("real"))
+		{
+			T.PinCategory = UEdGraphSchema_K2::PC_Real;
+			FString Sub; T.PinSubCategory = Op->TryGetStringField(TEXT("sub"), Sub) && Sub == TEXT("float")
+				? UEdGraphSchema_K2::PC_Float : UEdGraphSchema_K2::PC_Double;
+		}
+		else if (Category == TEXT("bool")) { T.PinCategory = UEdGraphSchema_K2::PC_Boolean; }
+		else if (Category == TEXT("int")) { T.PinCategory = UEdGraphSchema_K2::PC_Int; }
+		else if (Category == TEXT("byte")) { T.PinCategory = UEdGraphSchema_K2::PC_Byte; }
+		else if (Category == TEXT("name")) { T.PinCategory = UEdGraphSchema_K2::PC_Name; }
+		else if (Category == TEXT("string")) { T.PinCategory = UEdGraphSchema_K2::PC_String; }
+		else if (Category == TEXT("text")) { T.PinCategory = UEdGraphSchema_K2::PC_Text; }
+		else
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("    addVar: unsupported category '%s'"), *Category);
+			return false;
+		}
+		FString Container;
+		if (Op->TryGetStringField(TEXT("container"), Container))
+		{
+			if (Container == TEXT("Array")) { T.ContainerType = EPinContainerType::Array; }
+			else if (Container == TEXT("Set")) { T.ContainerType = EPinContainerType::Set; }
+		}
+		const bool bOk = FBlueprintEditorUtils::AddMemberVariable(Blueprint, FName(*VarName), T);
+		UE_LOG(LogBlueprintOracle, Display, TEXT("    addVar '%s' (%s%s) -> %s"),
+			*VarName, *Category, T.ContainerType == EPinContainerType::Array ? TEXT("[]") : TEXT(""),
+			bOk ? TEXT("ok") : TEXT("FAILED"));
+		return bOk;
+	}
+
+	if (OpName == TEXT("removeNode") || OpName == TEXT("retargetVarRef"))
+	{
+		// Both locate a node by GUID within a named graph.
+		const FString GraphName = Op->GetStringField(TEXT("graph"));
+		UEdGraph* Graph = FindGraphByName(Blueprint, GraphName);
+		if (!Graph)
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("    %s: graph '%s' not found"), *OpName, *GraphName);
+			return false;
+		}
+		const FString NodeGuid = Op->GetStringField(TEXT("node"));
+		UEdGraphNode* Target = nullptr;
+		for (UEdGraphNode* N : Graph->Nodes)
+		{
+			if (N && N->NodeGuid.ToString(EGuidFormats::Digits) == NodeGuid) { Target = N; break; }
+		}
+		if (!Target)
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("    %s: node '%s' not found in '%s'"), *OpName, *NodeGuid, *GraphName);
+			return false;
+		}
+
+		if (OpName == TEXT("removeNode"))
+		{
+			Graph->RemoveNode(Target);
+			UE_LOG(LogBlueprintOracle, Display, TEXT("    removeNode '%s' from '%s'"), *NodeGuid, *GraphName);
+			return true;
+		}
+
+		// retargetVarRef: point a VariableGet/Set at a different member (e.g. InventoryItem_A -> Items),
+		// then ReconstructNode so the value pin takes the new variable's type. Downstream wildcard
+		// nodes (GetArrayItem) follow via their own reconstruct on link change.
+		UK2Node_Variable* VarNode = Cast<UK2Node_Variable>(Target);
+		if (!VarNode)
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("    retargetVarRef: node '%s' is not a variable node"), *NodeGuid);
+			return false;
+		}
+		const FString ToVar = Op->GetStringField(TEXT("toVar"));
+		FString ToClassPath;
+		if (Op->TryGetStringField(TEXT("toClass"), ToClassPath) && !ToClassPath.IsEmpty())
+		{
+			VarNode->VariableReference.SetExternalMember(FName(*ToVar), ResolveClass(ToClassPath));
+		}
+		else
+		{
+			VarNode->VariableReference.SetSelfMember(FName(*ToVar));
+		}
+		VarNode->ReconstructNode();
+		UE_LOG(LogBlueprintOracle, Display, TEXT("    retargetVarRef '%s' -> %s"), *NodeGuid, *ToVar);
+		return true;
+	}
+
 	UE_LOG(LogBlueprintOracle, Error, TEXT("    unknown op '%s'"), *OpName);
 	return false;
 }

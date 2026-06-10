@@ -39,6 +39,8 @@
 #include "Misc/Paths.h"
 #include "Misc/PackageName.h"
 #include "HAL/FileManager.h"
+#include "HAL/PlatformFileManager.h"
+#include "GenericPlatform/GenericPlatformFile.h"
 
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
@@ -734,6 +736,79 @@ bool UBlueprintOracleCommandlet::ApplyMigrationOp(UBlueprint* Blueprint, const T
 		return true;
 	}
 
+	if (OpName == TEXT("setCallPinDefault"))
+	{
+		// Recover/repair a literal default on a CallFunction input pin. Used when a
+		// param rename (a BP pin name not reproducible as a C++ identifier, e.g.
+		// "Items Lost (Percent)" -> ItemsLostPercent) leaves the new pin at its type
+		// default and the old value stranded on an orphaned pin. ReconstructNode drops
+		// the orphan; we then write the intended value onto the canonical pin.
+		const FString Member = Op->GetStringField(TEXT("member"));
+		const FString PinName = Op->GetStringField(TEXT("pin"));
+		const FString Value = Op->GetStringField(TEXT("value"));
+		FString OnlyGraph;
+		Op->TryGetStringField(TEXT("graph"), OnlyGraph);
+
+		TArray<UEdGraph*> Graphs;
+		Graphs.Append(Blueprint->UbergraphPages);
+		Graphs.Append(Blueprint->FunctionGraphs);
+		Graphs.Append(Blueprint->MacroGraphs);
+
+		int32 Count = 0;
+		for (UEdGraph* Graph : Graphs)
+		{
+			if (!Graph || (!OnlyGraph.IsEmpty() && Graph->GetName() != OnlyGraph))
+			{
+				continue;
+			}
+			for (UEdGraphNode* Node : Graph->Nodes)
+			{
+				UK2Node_CallFunction* Call = Cast<UK2Node_CallFunction>(Node);
+				if (Call && Call->FunctionReference.GetMemberName() == FName(*Member))
+				{
+					Call->ReconstructNode();
+					if (UEdGraphPin* Pin = Call->FindPin(FName(*PinName), EGPD_Input))
+					{
+						Pin->Modify();
+						if (const UEdGraphSchema* Schema = Pin->GetSchema())
+						{
+							Schema->TrySetDefaultValue(*Pin, Value);
+						}
+						else
+						{
+							Pin->DefaultValue = Value;
+						}
+						++Count;
+					}
+					else
+					{
+						UE_LOG(LogBlueprintOracle, Warning,
+							TEXT("    setCallPinDefault: pin '%s' not found on a '%s' node"), *PinName, *Member);
+					}
+
+					// ReconstructNode retains orphaned pins (stale name + value) so users
+					// don't silently lose data; once we've transferred the value, strip
+					// them, else they emit a "pin no longer exists" warning forever.
+					TArray<UEdGraphPin*> Orphans;
+					for (UEdGraphPin* P : Call->Pins)
+					{
+						if (P && P->bOrphanedPin)
+						{
+							Orphans.Add(P);
+						}
+					}
+					for (UEdGraphPin* P : Orphans)
+					{
+						Call->RemovePin(P);
+					}
+				}
+			}
+		}
+		UE_LOG(LogBlueprintOracle, Display, TEXT("    setCallPinDefault %s.%s = '%s' (%d node(s))"),
+			*Member, *PinName, *Value, Count);
+		return true;
+	}
+
 	UE_LOG(LogBlueprintOracle, Error, TEXT("    unknown op '%s'"), *OpName);
 	return false;
 }
@@ -855,6 +930,9 @@ int32 UBlueprintOracleCommandlet::RunMigration(const FString& SpecPath, bool bCo
 			Package->MarkPackageDirty();
 			const FString FileName = FPackageName::LongPackageNameToFilename(
 				Package->GetName(), FPackageName::GetAssetPackageExtension());
+			// Content is often read-only (source-control working copy); clear it so the
+			// save can overwrite. The caller opted into mutation via -commit.
+			FPlatformFileManager::Get().GetPlatformFile().SetReadOnly(*FileName, false);
 			FSavePackageArgs SaveArgs;
 			SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
 			SaveArgs.SaveFlags = SAVE_NoError;

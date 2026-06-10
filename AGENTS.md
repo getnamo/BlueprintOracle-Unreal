@@ -201,6 +201,59 @@ that C++ now owns. The oracle can do all of this programmatically (the verified 
 `-selftest` proof are in the README). These are the load-bearing moves. Each runs in the editor
 commandlet; **compile-gate and save after each asset** (see the end).
 
+You normally don't hand-write this C++. The common moves are exposed as a **declarative,
+compile-gated `-migrate` mode** (below); the raw API (Moves 1–4) is what each op does under the
+hood, and what you reach for when an edit isn't yet covered by an op.
+
+### Driving it: the `-migrate` spec
+
+```
+UnrealEditor-Cmd.exe <Project>.uproject -run=BlueprintOracle -migrate -spec="<path>.json" \
+    -unattended -nullrhi -nosplash -nopause -log          # dry run (default): edits in memory,
+                                                           # compiles, reports — saves nothing
+# add -commit to write .uasset(s), but only for assets that compiled clean:
+    ... -migrate -spec="<path>.json" -commit
+```
+
+The spec is a list of assets, each with an **ordered** list of ops. Each asset is loaded, its ops
+applied in order, `RefreshAllNodes`'d, then **compile-gated** (`FCompilerResultsLog`): it is saved
+only on 0 errors and only with `-commit` (read-only working-copy files are cleared first). Dry-run
+reports every asset's error/warning count without touching disk — always dry-run first.
+
+```jsonc
+{
+  "assets": [
+    {
+      "package": "/Game/Blueprints/BP_MyComponent",
+      "ops": [
+        { "op": "removeGraph", "name": "DoThingBP" },          // delete a BP graph C++ now owns
+        { "op": "removeVar",   "name": "LocalCounter" },          // delete a member var (now inherited)
+        { "op": "reparent",    "newParent": "/Script/MyModule.MyComponentBase" }
+      ]
+    }
+  ]
+}
+```
+
+| op | fields | does | = Move |
+|----|--------|------|--------|
+| `reparent` | `newParent` (class path) | set `ParentClass` + `RefreshAllNodes` | 3 |
+| `removeGraph` | `name` | `RemoveGraph` (idempotent: warns + skips if absent) | 3 |
+| `removeVar` | `name` | `RemoveMemberVariable` | 4 |
+| `replaceVarRefs` | `from`, `to` | `ReplaceVariableReferences` (rename all use sites) | 4 |
+| `redirectCall` | `fromMember`, `toMember`, `toClass`, `graph?` | retarget every matching `CallFunction` + `ReconstructNode` (auto-rewire by pin name) | 1 |
+| `setCallPinDefault` | `member`, `pin`, `value`, `graph?` | reconstruct the call node, write a literal onto an input pin, **strip orphaned pins** | 2 (repair) |
+
+`graph?` (optional) restricts an op to one named graph; omit to apply across all graphs of the asset.
+
+**Ordering matters.** Do removals *before* a reparent so same-named C++ functions on the new parent
+don't collide with the BP graphs mid-apply; reparent last. Reads cleanest as: strip what C++ owns,
+then reparent onto it.
+
+**When an op doesn't exist yet** for your edit (e.g. splicing a converter node mid-wire — Move 2's
+general case), drop to the raw API below and add an op for it. The ops are thin wrappers over
+exactly these calls.
+
 ### Move 1 — Reattach a BP function call to a C++ function (auto-rewire)
 
 The most common move: a graph calls a Blueprint function (or BP library) whose logic now lives in
@@ -273,10 +326,40 @@ FBlueprintEditorUtils::ReplaceVariableReferences(Blueprint, TEXT("LegacyArray"),
 
 ### Always — verify the edit (closed loop)
 
-An edit is "done" only when both hold:
-1. `FKismetEditorUtilities::CompileBlueprint` is clean — **a failed compile is a hard stop; never
-   `SavePackages` a non-compiling blueprint.**
-2. Re-run the *read* path on the same BP and diff the new `graph.json` against the intended result.
+An edit is "done" only when all hold:
+1. The asset's own compile is clean — `-migrate`'s compile gate enforces this; **never save a
+   non-compiling blueprint.** (0 warnings too: a dropped wire usually surfaces as a warning, not an
+   error.)
+2. **Re-extract the callers, not just the edited asset.** The compile gate only compiles the asset
+   you edited. When you reparent/strip functions, the breakage lands in *other* packages that call
+   them — and those don't recompile until loaded. So after `-commit`, run the read path on the
+   migrated asset **and its callers** (find them by grepping prior extractions for
+   `"memberName": "<func>"`), then grep the log for `[Compiler] ... pruned` / `... no longer exists`.
+   This is how the two real Phase-1 caller bugs were caught; the single-asset gate was green for both.
+3. Diff the re-read `graph.json` against the intended result (e.g. confirm the changed call node kept
+   its wires / its literal default).
 
 Run on a branch and commit per asset (or per op batch) so any bad edit is trivially reverted. Use
 only the non-UI APIs (avoid `Open*Menu` variants) so it stays headless.
+
+### Gotchas the closed loop catches (and how to pre-empt them)
+
+For Move-1 auto-rewire to reconnect a caller's wires, the C++ pin **names** must mirror the BP
+function's — and so must its **shape**. Mismatches the compiler reports as caller warnings:
+
+- **Pure vs impure must match the call site, not the entry.** A BP function *entry* node always has a
+  `then` exec pin even when the function is `BlueprintPure`, so don't infer purity there. Read it from
+  the **callers**: if their `CallFunction` nodes have no exec pins, the function is pure → mark the
+  C++ `BlueprintPure`. Get this wrong and the reconstructed caller node gains unconnected exec pins
+  and the compiler *prunes* it (its output reads as default — a silent logic change). (Real case:
+  `ItemEquippedAtIndex`.)
+- **Return value → named pin.** A C++ `return` becomes the pin `ReturnValue`; a BP function's result
+  pin has the author's name (e.g. `TotalWeight`). To reconnect, give the C++ function a **named
+  out-param ref** (`void F(..., double& TotalWeight)`) instead of a return.
+- **Param names with spaces/parens can't be mirrored** (`"Items Lost (Percent)"` is not a C++
+  identifier). That pin won't auto-reconnect and its literal default is stranded on an orphaned pin —
+  recover it with `setCallPinDefault` (reads the orphan's value, writes the canonical pin, strips the
+  orphan).
+- **Tell your warnings from the project's.** Re-extraction recompiles transitive deps, so you'll see
+  pre-existing, unrelated warnings too. Confirm a warning is yours by checking the function/asset it
+  names is actually one you touched.

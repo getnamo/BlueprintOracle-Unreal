@@ -41,6 +41,12 @@ At least one of `-dir` / `-asset` is required.
 Performance: editor cold-start dominates (~1–2 min once); each Blueprint then extracts in roughly
 0.3–1 s, so batch as many as possible into a single invocation.
 
+## Converting a Blueprint to C++
+
+See **[AGENTS.md](AGENTS.md)** for the step-by-step playbook (for an AI agent or a
+human): how to run the oracle, read `graph.json`, map nodes/pins/variables/components to
+C++, and the gotchas (Core Redirects, unserialized defaults, macros, latent flow).
+
 ## Install
 
 Drop into your project's `Plugins/` folder (or add as a submodule) and enable it for the Editor target.

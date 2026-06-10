@@ -64,6 +64,20 @@ private:
 	void WriteEnum(UUserDefinedEnum* Enum, const FString& OutPath);
 
 	/**
+	 * Apply a JSON migration spec: a list of assets, each with an ordered list of
+	 * structural edit ops (reparent / removeGraph / removeVar / redirectCall /
+	 * replaceVarRefs). Each asset is edited in memory, RefreshAllNodes'd, then
+	 * compile-gated: only on a clean compile (and only when bCommit is true) is the
+	 * package saved to disk. With bCommit=false it is a dry run - it reports the
+	 * compile result of every asset without touching any .uasset. Returns 0 if every
+	 * asset compiled clean, non-zero otherwise.
+	 */
+	int32 RunMigration(const FString& SpecPath, bool bCommit);
+
+	/** Apply one op object to an already-loaded blueprint. Returns false on a hard error. */
+	bool ApplyMigrationOp(UBlueprint* Blueprint, const TSharedPtr<class FJsonObject>& Op);
+
+	/**
 	 * Proof-of-concept for programmatic blueprint editing. Builds a disposable
 	 * in-memory blueprint and exercises the write-side APIs end-to-end:
 	 * create, add variable, reparent, spawn + wire a function-call node, redirect

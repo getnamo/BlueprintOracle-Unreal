@@ -21,10 +21,12 @@
 // Write-side (programmatic blueprint editing) APIs.
 #include "Kismet2/KismetEditorUtilities.h"
 #include "Kismet2/BlueprintEditorUtils.h"
+#include "Kismet2/CompilerResultsLog.h"
 #include "EdGraphSchema_K2.h"
 #include "Engine/BlueprintGeneratedClass.h"
 #include "Kismet/KismetMathLibrary.h"
 #include "GameFramework/Pawn.h"
+#include "UObject/SavePackage.h"
 
 #include "ScriptDisassembler.h"
 
@@ -143,6 +145,20 @@ int32 UBlueprintOracleCommandlet::Main(const FString& Params)
 		}
 		IFileManager::Get().MakeDirectory(*OutDirSelf, /*Tree*/ true);
 		return RunSelfTest(OutDirSelf);
+	}
+
+	// -migrate -spec=<file.json> : apply a structural edit spec, compile-gated.
+	// Dry run by default (no .uasset is written); pass -commit to save on clean compile.
+	if (FParse::Param(*Params, TEXT("migrate")))
+	{
+		FString SpecPath;
+		if (!FParse::Value(*Params, TEXT("spec="), SpecPath) || SpecPath.IsEmpty())
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("-migrate requires -spec=<path to migration json>."));
+			return 1;
+		}
+		const bool bCommit = FParse::Param(*Params, TEXT("commit"));
+		return RunMigration(SpecPath, bCommit);
 	}
 
 	TArray<FString> AssetPaths;
@@ -579,6 +595,290 @@ void UBlueprintOracleCommandlet::WriteEnum(UUserDefinedEnum* Enum, const FString
 
 	SaveJson(Root, OutPath);
 	UE_LOG(LogBlueprintOracle, Display, TEXT("  wrote enum.json (%d entries)"), Entries.Num());
+}
+
+namespace
+{
+	// Resolve a class by full path ("/Script/Module.ClassName") or generated-class path.
+	UClass* ResolveClass(const FString& Path)
+	{
+		if (Path.IsEmpty())
+		{
+			return nullptr;
+		}
+		if (UClass* Found = FindObject<UClass>(nullptr, *Path))
+		{
+			return Found;
+		}
+		return LoadObject<UClass>(nullptr, *Path);
+	}
+
+	// Find a function graph (or any authored graph) on a blueprint by name.
+	UEdGraph* FindGraphByName(UBlueprint* Blueprint, const FString& Name)
+	{
+		auto Search = [&Name](const TArray<UEdGraph*>& Graphs) -> UEdGraph*
+		{
+			for (UEdGraph* G : Graphs)
+			{
+				if (G && G->GetName() == Name)
+				{
+					return G;
+				}
+			}
+			return nullptr;
+		};
+		if (UEdGraph* G = Search(Blueprint->FunctionGraphs)) { return G; }
+		if (UEdGraph* G = Search(Blueprint->UbergraphPages)) { return G; }
+		if (UEdGraph* G = Search(Blueprint->MacroGraphs)) { return G; }
+		return nullptr;
+	}
+}
+
+bool UBlueprintOracleCommandlet::ApplyMigrationOp(UBlueprint* Blueprint, const TSharedPtr<FJsonObject>& Op)
+{
+	FString OpName;
+	if (!Op->TryGetStringField(TEXT("op"), OpName))
+	{
+		UE_LOG(LogBlueprintOracle, Error, TEXT("    op object missing 'op' field"));
+		return false;
+	}
+
+	if (OpName == TEXT("reparent"))
+	{
+		const FString NewParent = Op->GetStringField(TEXT("newParent"));
+		UClass* ParentClass = ResolveClass(NewParent);
+		if (!ParentClass)
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("    reparent: cannot resolve class '%s'"), *NewParent);
+			return false;
+		}
+		Blueprint->ParentClass = ParentClass;
+		FBlueprintEditorUtils::RefreshAllNodes(Blueprint);
+		UE_LOG(LogBlueprintOracle, Display, TEXT("    reparent -> %s"), *ParentClass->GetPathName());
+		return true;
+	}
+
+	if (OpName == TEXT("removeGraph"))
+	{
+		const FString GraphName = Op->GetStringField(TEXT("name"));
+		UEdGraph* Graph = FindGraphByName(Blueprint, GraphName);
+		if (!Graph)
+		{
+			// Not fatal: the graph may already be gone (idempotent re-run).
+			UE_LOG(LogBlueprintOracle, Warning, TEXT("    removeGraph: '%s' not found (skipping)"), *GraphName);
+			return true;
+		}
+		FBlueprintEditorUtils::RemoveGraph(Blueprint, Graph, EGraphRemoveFlags::Default);
+		UE_LOG(LogBlueprintOracle, Display, TEXT("    removeGraph '%s'"), *GraphName);
+		return true;
+	}
+
+	if (OpName == TEXT("removeVar"))
+	{
+		const FString VarName = Op->GetStringField(TEXT("name"));
+		FBlueprintEditorUtils::RemoveMemberVariable(Blueprint, FName(*VarName));
+		UE_LOG(LogBlueprintOracle, Display, TEXT("    removeVar '%s'"), *VarName);
+		return true;
+	}
+
+	if (OpName == TEXT("replaceVarRefs"))
+	{
+		const FString From = Op->GetStringField(TEXT("from"));
+		const FString To = Op->GetStringField(TEXT("to"));
+		FBlueprintEditorUtils::ReplaceVariableReferences(Blueprint, FName(*From), FName(*To));
+		UE_LOG(LogBlueprintOracle, Display, TEXT("    replaceVarRefs '%s' -> '%s'"), *From, *To);
+		return true;
+	}
+
+	if (OpName == TEXT("redirectCall"))
+	{
+		// Redirect every CallFunction node matching 'fromMember' to 'toMember' on
+		// 'toClass' (Move 1 auto-rewire). Optional 'graph' restricts to one graph.
+		const FString FromMember = Op->GetStringField(TEXT("fromMember"));
+		const FString ToMember = Op->GetStringField(TEXT("toMember"));
+		const FString ToClassPath = Op->GetStringField(TEXT("toClass"));
+		UClass* ToClass = ResolveClass(ToClassPath);
+		if (!ToClass)
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("    redirectCall: cannot resolve toClass '%s'"), *ToClassPath);
+			return false;
+		}
+		FString OnlyGraph;
+		Op->TryGetStringField(TEXT("graph"), OnlyGraph);
+
+		TArray<UEdGraph*> Graphs;
+		Graphs.Append(Blueprint->UbergraphPages);
+		Graphs.Append(Blueprint->FunctionGraphs);
+		Graphs.Append(Blueprint->MacroGraphs);
+
+		int32 Count = 0;
+		for (UEdGraph* Graph : Graphs)
+		{
+			if (!Graph || (!OnlyGraph.IsEmpty() && Graph->GetName() != OnlyGraph))
+			{
+				continue;
+			}
+			for (UEdGraphNode* Node : Graph->Nodes)
+			{
+				UK2Node_CallFunction* Call = Cast<UK2Node_CallFunction>(Node);
+				if (Call && Call->FunctionReference.GetMemberName() == FName(*FromMember))
+				{
+					Call->FunctionReference.SetExternalMember(FName(*ToMember), ToClass);
+					Call->ReconstructNode();
+					++Count;
+				}
+			}
+		}
+		UE_LOG(LogBlueprintOracle, Display, TEXT("    redirectCall '%s' -> %s::%s (%d node(s))"),
+			*FromMember, *ToClass->GetName(), *ToMember, Count);
+		return true;
+	}
+
+	UE_LOG(LogBlueprintOracle, Error, TEXT("    unknown op '%s'"), *OpName);
+	return false;
+}
+
+int32 UBlueprintOracleCommandlet::RunMigration(const FString& SpecPath, bool bCommit)
+{
+	UE_LOG(LogBlueprintOracle, Display, TEXT("BlueprintOracle migration: spec=%s  mode=%s"),
+		*SpecPath, bCommit ? TEXT("COMMIT") : TEXT("DRY-RUN"));
+
+	FString SpecText;
+	if (!FFileHelper::LoadFileToString(SpecText, *SpecPath))
+	{
+		UE_LOG(LogBlueprintOracle, Error, TEXT("Cannot read spec file %s"), *SpecPath);
+		return 1;
+	}
+
+	TSharedPtr<FJsonObject> SpecRoot;
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(SpecText);
+	if (!FJsonSerializer::Deserialize(Reader, SpecRoot) || !SpecRoot.IsValid())
+	{
+		UE_LOG(LogBlueprintOracle, Error, TEXT("Spec file %s is not valid JSON"), *SpecPath);
+		return 1;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* Assets = nullptr;
+	if (!SpecRoot->TryGetArrayField(TEXT("assets"), Assets))
+	{
+		UE_LOG(LogBlueprintOracle, Error, TEXT("Spec has no 'assets' array"));
+		return 1;
+	}
+
+	int32 FailedAssets = 0;
+	int32 SavedAssets = 0;
+
+	for (const TSharedPtr<FJsonValue>& AssetVal : *Assets)
+	{
+		const TSharedPtr<FJsonObject> AssetObj = AssetVal->AsObject();
+		if (!AssetObj.IsValid())
+		{
+			continue;
+		}
+		const FString PackageName = AssetObj->GetStringField(TEXT("package"));
+		UE_LOG(LogBlueprintOracle, Display, TEXT("--- %s ---"), *PackageName);
+
+		UPackage* Package = LoadPackage(nullptr, *PackageName, LOAD_None);
+		if (!Package)
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("  could not load package"));
+			++FailedAssets;
+			continue;
+		}
+		Package->FullyLoad();
+
+		UBlueprint* Blueprint = nullptr;
+		{
+			TArray<UObject*> Objects;
+			GetObjectsWithOuter(Package, Objects, /*bIncludeNestedObjects*/ false);
+			for (UObject* Obj : Objects)
+			{
+				Blueprint = Cast<UBlueprint>(Obj);
+				if (Blueprint) { break; }
+			}
+		}
+		if (!Blueprint)
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("  no blueprint in package"));
+			++FailedAssets;
+			continue;
+		}
+
+		// Apply ops in order.
+		bool bOpsOk = true;
+		const TArray<TSharedPtr<FJsonValue>>* Ops = nullptr;
+		if (AssetObj->TryGetArrayField(TEXT("ops"), Ops))
+		{
+			for (const TSharedPtr<FJsonValue>& OpVal : *Ops)
+			{
+				const TSharedPtr<FJsonObject> Op = OpVal->AsObject();
+				if (!Op.IsValid()) { continue; }
+				if (!ApplyMigrationOp(Blueprint, Op))
+				{
+					bOpsOk = false;
+					break;
+				}
+			}
+		}
+
+		if (!bOpsOk)
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("  op application failed; not saving"));
+			++FailedAssets;
+			continue;
+		}
+
+		// Compile-gate.
+		FBlueprintEditorUtils::RefreshAllNodes(Blueprint);
+		FCompilerResultsLog Results;
+		FKismetEditorUtilities::CompileBlueprint(Blueprint, EBlueprintCompileOptions::None, &Results);
+		const bool bClean = (Blueprint->Status == BS_UpToDate || Blueprint->Status == BS_UpToDateWithWarnings)
+			&& Results.NumErrors == 0;
+
+		UE_LOG(LogBlueprintOracle, Display, TEXT("  compile: %d error(s), %d warning(s) -> %s"),
+			Results.NumErrors, Results.NumWarnings, bClean ? TEXT("CLEAN") : TEXT("FAILED"));
+		for (const TSharedRef<FTokenizedMessage>& Msg : Results.Messages)
+		{
+			UE_LOG(LogBlueprintOracle, Warning, TEXT("    [%s] %s"),
+				Msg->GetSeverity() == EMessageSeverity::Error ? TEXT("ERR") : TEXT("WARN"),
+				*Msg->ToText().ToString());
+		}
+
+		if (!bClean)
+		{
+			++FailedAssets;
+			continue;
+		}
+
+		if (bCommit)
+		{
+			Package->MarkPackageDirty();
+			const FString FileName = FPackageName::LongPackageNameToFilename(
+				Package->GetName(), FPackageName::GetAssetPackageExtension());
+			FSavePackageArgs SaveArgs;
+			SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+			SaveArgs.SaveFlags = SAVE_NoError;
+			const FSavePackageResultStruct Result = UPackage::Save(Package, nullptr, *FileName, SaveArgs);
+			if (Result.IsSuccessful())
+			{
+				UE_LOG(LogBlueprintOracle, Display, TEXT("  SAVED %s"), *FileName);
+				++SavedAssets;
+			}
+			else
+			{
+				UE_LOG(LogBlueprintOracle, Error, TEXT("  SAVE FAILED %s"), *FileName);
+				++FailedAssets;
+			}
+		}
+		else
+		{
+			UE_LOG(LogBlueprintOracle, Display, TEXT("  dry-run: compiled clean (not saved)"));
+		}
+	}
+
+	UE_LOG(LogBlueprintOracle, Display, TEXT("Migration done: %d asset(s) failed, %d saved."),
+		FailedAssets, SavedAssets);
+	return FailedAssets == 0 ? 0 : 1;
 }
 
 int32 UBlueprintOracleCommandlet::RunSelfTest(const FString& OutDir)

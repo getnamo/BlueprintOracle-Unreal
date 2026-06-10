@@ -103,7 +103,7 @@ namespace
 		FString Out;
 		TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Out);
 		FJsonSerializer::Serialize(Root, Writer);
-		if (!FFileHelper::SaveStringToFile(Out, *Path, FFileHelper::EEncodingOptions::ForceUTF8))
+		if (!FFileHelper::SaveStringToFile(Out, *Path, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
 		{
 			UE_LOG(LogBlueprintOracle, Error, TEXT("Failed to write %s"), *Path);
 		}
@@ -436,7 +436,7 @@ void UBlueprintOracleCommandlet::WriteGraphs(UBlueprint* Blueprint, const FStrin
 	Root->SetArrayField(TEXT("graphs"), GraphsJson);
 
 	SaveJson(Root, OutDir / AssetName + TEXT(".graph.json"));
-	FFileHelper::SaveStringToFile(NodesText, *(OutDir / AssetName + TEXT(".nodes.txt")), FFileHelper::EEncodingOptions::ForceUTF8);
+	FFileHelper::SaveStringToFile(NodesText, *(OutDir / AssetName + TEXT(".nodes.txt")), FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
 	UE_LOG(LogBlueprintOracle, Display, TEXT("  wrote graph.json + nodes.txt (%d graphs)"), GraphsJson.Num());
 }
 
@@ -459,6 +459,6 @@ void UBlueprintOracleCommandlet::WriteDisasm(UBlueprint* Blueprint, const FStrin
 		Out.Logf(TEXT(""));
 	}
 
-	FFileHelper::SaveStringToFile(static_cast<const FString&>(Out), *OutPath, FFileHelper::EEncodingOptions::ForceUTF8);
+	FFileHelper::SaveStringToFile(static_cast<const FString&>(Out), *OutPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
 	UE_LOG(LogBlueprintOracle, Display, TEXT("  wrote disasm.txt"));
 }

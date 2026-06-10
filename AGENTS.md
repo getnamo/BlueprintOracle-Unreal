@@ -227,7 +227,7 @@ reports every asset's error/warning count without touching disk — always dry-r
       "package": "/Game/Blueprints/BP_MyComponent",
       "ops": [
         { "op": "removeGraph", "name": "DoThingBP" },          // delete a BP graph C++ now owns
-        { "op": "removeVar",   "name": "LocalCounter" },          // delete a member var (now inherited)
+        { "op": "removeVar",   "name": "LocalCounter" },       // delete a member var (now inherited)
         { "op": "reparent",    "newParent": "/Script/MyModule.MyComponentBase" }
       ]
     }
@@ -276,8 +276,8 @@ during migration. That single discipline turns every call-site rewire into the o
 
 ### Move 2 — Redirect across a changed signature / struct param (pin remap + converters)
 
-When the signature differs — e.g. the BP function took `S_LegacyData` but the C++ one
-takes `FMyData` — `ReconstructNode` drops the mismatched pins. Remap explicitly, splicing a
+When the signature differs — e.g. the BP function took a legacy struct `S_LegacyData` but the C++
+one takes `FMyData` — `ReconstructNode` drops the mismatched pins. Remap explicitly, splicing a
 **converter node** where a *type* changed:
 
 ```cpp
@@ -287,25 +287,24 @@ FGraphNodeCreator<UK2Node_CallFunction> C(*Graph);
 UK2Node_CallFunction* Conv = C.CreateNode();
 Conv->FunctionReference.SetExternalMember(TEXT("MakeData"), UMyCompatLibrary::StaticClass());
 C.Finalize();
-OldSourcePin->MakeLinkTo(Conv->FindPin(TEXT("LegacyField"), EGPD_Input));          // feed the converter
-Conv->FindPin(TEXT("ReturnValue"), EGPD_Output)->MakeLinkTo(NewCall->FindPin(TEXT("Item"), EGPD_Input));
+OldSourcePin->MakeLinkTo(Conv->FindPin(TEXT("LegacyField"), EGPD_Input));             // feed the converter
+Conv->FindPin(TEXT("ReturnValue"), EGPD_Output)->MakeLinkTo(NewCall->FindPin(TEXT("Data"), EGPD_Input));
 ```
 
-Converter choices for this project's item migration:
-- **Enum param changed** (e.g. `E_Foo` pin → an `EFoo` pin): splice the matching bridge
-  in `UMyCompatLibrary` (`LegacyToNew`, `LegacyToNew`, …).
-- **Whole item struct changed** (`S_LegacyData` → `FMyData`): the BP shim *breaks*
-  the legacy struct (BP UserDefinedStructs have no C++ header, so they can't be passed whole to
-  C++) and feeds the fields into `UMyCompatLibrary::MakeData` + the `Make*TypeData`
-  builders. The reverse (`FMyData` → legacy) is a native BP BreakStruct (it *is* a C++
-  BlueprintType) plus the enum bridges.
+Converter choices, by what changed:
+- **Enum param changed** (e.g. a legacy `E_Foo` pin → a C++ `EFoo` pin): splice a matching
+  enum-bridge function from your compat library (a `BlueprintPure` `LegacyToNew(uint8)` helper).
+- **Whole struct changed** (a BP UserDefinedStruct → a C++ struct): the BP shim *breaks* the legacy
+  struct (BP UserDefinedStructs have no C++ header, so they can't be passed whole to C++) and feeds
+  the fields into a C++ `Make*` builder in your compat library. The reverse (C++ struct → legacy) is
+  a native BP BreakStruct (the C++ struct *is* a BlueprintType) plus the enum bridges.
 
 ### Move 3 — Reparent onto a C++ base + strip migrated graphs
 
 Once C++ owns a function, delete its BP graph; once a BP should derive from a C++ base, reparent:
 
 ```cpp
-Blueprint->ParentClass = UMyComponentBase::StaticClass();   // Phase 3: BP_MyActor onto C++ base
+Blueprint->ParentClass = UMyComponentBase::StaticClass();   // reparent the BP onto its new C++ base
 FBlueprintEditorUtils::RefreshAllNodes(Blueprint);
 FBlueprintEditorUtils::RemoveGraph(Blueprint, MigratedFunctionGraph);   // drop the now-C++ function
 FKismetEditorUtilities::CompileBlueprint(Blueprint);
@@ -319,7 +318,7 @@ T.PinCategory = UEdGraphSchema_K2::PC_Struct;
 T.PinSubCategoryObject = FMyData::StaticStruct();
 T.ContainerType = EPinContainerType::Array;
 FBlueprintEditorUtils::RemoveMemberVariable(Blueprint, TEXT("LegacyArray"));  // S_LegacyData[]
-FBlueprintEditorUtils::AddMemberVariable(Blueprint, TEXT("Items"), T);            // FMyData[]
+FBlueprintEditorUtils::AddMemberVariable(Blueprint, TEXT("Items"), T);        // FMyData[]
 FBlueprintEditorUtils::ReplaceVariableReferences(Blueprint, TEXT("LegacyArray"), TEXT("Items"));
 ```
 (References whose pin *type* also changed still need Move-2 converters at their use sites.)

@@ -41,11 +41,61 @@ At least one of `-dir` / `-asset` is required.
 Performance: editor cold-start dominates (~1–2 min once); each Blueprint then extracts in roughly
 0.3–1 s, so batch as many as possible into a single invocation.
 
+It also dumps **UserDefinedStruct** and **UserDefinedEnum** assets (`<Asset>.struct.json` /
+`<Asset>.enum.json`) — field names + C++ types for structs, and authored name + display name +
+value for enum entries (which resolves Blueprint's opaque `NewEnumeratorN` names).
+
 ## Converting a Blueprint to C++
 
 See **[AGENTS.md](AGENTS.md)** for the step-by-step playbook (for an AI agent or a
 human): how to run the oracle, read `graph.json`, map nodes/pins/variables/components to
 C++, and the gotchas (Core Redirects, unserialized defaults, macros, latent flow).
+
+## Editing blueprints programmatically (write side)
+
+The oracle runs in full editor context, so it can also **edit** blueprints the way the editor
+does — driven from a commandlet instead of by hand. This makes bulk refactors and BP→C++
+migrations scriptable and verifiable: edit, compile, then re-run the read path and diff the
+`graph.json` against the intended result.
+
+Run the built-in proof end-to-end (creates a disposable in-memory blueprint, exercises the
+APIs, and reads it back — touches no live assets):
+
+```
+UnrealEditor-Cmd.exe <Project>.uproject -run=BlueprintOracle -selftest -unattended -nullrhi -nosplash -nopause -log
+```
+
+It reports `[PASS]/[FAIL]` for each step and returns non-zero on any failure.
+
+### Verified editing API (UE 5.5)
+
+| Operation | API |
+|---|---|
+| Create a blueprint | `FKismetEditorUtilities::CreateBlueprint` |
+| Reparent to a new base class | set `Blueprint->ParentClass`, then `FBlueprintEditorUtils::RefreshAllNodes` + `CompileBlueprint` |
+| Add / remove a member variable | `FBlueprintEditorUtils::AddMemberVariable` / `RemoveMemberVariable` |
+| Bulk re-point variable references | `FBlueprintEditorUtils::ReplaceVariableReferences` |
+| Add / remove an interface | `FBlueprintEditorUtils::ImplementNewInterface` / `RemoveInterface` |
+| Delete a function graph / a node | `FBlueprintEditorUtils::RemoveGraph` / `RemoveNode` |
+| Spawn a node | `FGraphNodeCreator<NodeType>` (or `FEdGraphUtilities::ImportNodesFromText`, the inverse of the read path's `ExportNodesToText`) |
+| Connect / disconnect pins | `UEdGraphPin::MakeLinkTo` / `BreakLinkTo`, or `UEdGraphSchema::TryCreateConnection` (validated) |
+| **Redirect a call to a different function (auto-rewire)** | `Node->FunctionReference.SetExternalMember(NewFunc, NewClass)` + `Node->ReconstructNode()` |
+| Compile | `FKismetEditorUtilities::CompileBlueprint` |
+| Save | `FEditorFileUtils::SavePackages` |
+
+### Auto-rewire
+
+`ReconstructNode()` rebuilds a node's pins from its (new) function and **reconnects existing
+wires to pins of the same name**. So redirecting a `K2Node_CallFunction` from a Blueprint
+function to a C++ function reconnects the pins automatically *when the C++ signature uses the
+same parameter names* — no manual rewiring. The self-test proves this by redirecting a live,
+wired call from `Abs` to `Sqrt` and confirming the input wire survives.
+
+### Guardrails
+
+- Run on a branch; commit per asset/op batch (edits mutate real `.uasset`s).
+- **Compile-gate every asset** — never `SavePackages` a blueprint that failed `CompileBlueprint`.
+- Use only the non-UI APIs above (avoid the `Open*Menu` variants) so it runs headless.
 
 ## Install
 

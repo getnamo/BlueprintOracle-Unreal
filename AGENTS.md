@@ -190,3 +190,93 @@ it across every Blueprint.
   flag it for manual handling (timers, timelines, latent actions, delegates).
 - **Multiple graphs share state** via member variables; reconstruct per-graph, then the
   class holds the variables.
+
+---
+
+## Write side — scripting the migration (editing blueprints)
+
+Reading a BP gets you the C++. The other half of a migration is *changing the blueprints* that
+call it — reattaching call sites to the new C++, remapping params, reparenting, deleting graphs
+that C++ now owns. The oracle can do all of this programmatically (the verified API + the
+`-selftest` proof are in the README). These are the load-bearing moves. Each runs in the editor
+commandlet; **compile-gate and save after each asset** (see the end).
+
+### Move 1 — Reattach a BP function call to a C++ function (auto-rewire)
+
+The most common move: a graph calls a Blueprint function (or BP library) whose logic now lives in
+C++. If the C++ function uses the **same parameter names and compatible pin types**, the wires
+reconnect themselves — no manual rewiring:
+
+```cpp
+// Walk every graph of the blueprint; redirect matching call nodes.
+if (auto* Call = Cast<UK2Node_CallFunction>(Node))
+    if (Call->FunctionReference.GetMemberName() == TEXT("DoThingBP"))
+    {
+        Call->FunctionReference.SetExternalMember(TEXT("DoThing"), UMyComponentBase::StaticClass());
+        Call->ReconstructNode();   // rebuilds pins from the new function; reconnects wires by name
+    }
+```
+
+Implication for the *C++* side: **name the new C++ functions and parameters to mirror the BP ones**
+during migration. That single discipline turns every call-site rewire into the one-liner above.
+(Renames can come later via `+FunctionRedirects` once the dust settles.)
+
+### Move 2 — Redirect across a changed signature / struct param (pin remap + converters)
+
+When the signature differs — e.g. the BP function took `S_LegacyData` but the C++ one
+takes `FMyData` — `ReconstructNode` drops the mismatched pins. Remap explicitly, splicing a
+**converter node** where a *type* changed:
+
+```cpp
+// After redirect+reconstruct, matching pins are reconnected; the changed param pin is empty.
+// Insert a converter between the original source and the new param:
+FGraphNodeCreator<UK2Node_CallFunction> C(*Graph);
+UK2Node_CallFunction* Conv = C.CreateNode();
+Conv->FunctionReference.SetExternalMember(TEXT("MakeData"), UMyCompatLibrary::StaticClass());
+C.Finalize();
+OldSourcePin->MakeLinkTo(Conv->FindPin(TEXT("LegacyField"), EGPD_Input));          // feed the converter
+Conv->FindPin(TEXT("ReturnValue"), EGPD_Output)->MakeLinkTo(NewCall->FindPin(TEXT("Item"), EGPD_Input));
+```
+
+Converter choices for this project's item migration:
+- **Enum param changed** (e.g. `E_Foo` pin → an `EFoo` pin): splice the matching bridge
+  in `UMyCompatLibrary` (`LegacyToNew`, `LegacyToNew`, …).
+- **Whole item struct changed** (`S_LegacyData` → `FMyData`): the BP shim *breaks*
+  the legacy struct (BP UserDefinedStructs have no C++ header, so they can't be passed whole to
+  C++) and feeds the fields into `UMyCompatLibrary::MakeData` + the `Make*TypeData`
+  builders. The reverse (`FMyData` → legacy) is a native BP BreakStruct (it *is* a C++
+  BlueprintType) plus the enum bridges.
+
+### Move 3 — Reparent onto a C++ base + strip migrated graphs
+
+Once C++ owns a function, delete its BP graph; once a BP should derive from a C++ base, reparent:
+
+```cpp
+Blueprint->ParentClass = UMyComponentBase::StaticClass();   // Phase 3: BP_MyActor onto C++ base
+FBlueprintEditorUtils::RefreshAllNodes(Blueprint);
+FBlueprintEditorUtils::RemoveGraph(Blueprint, MigratedFunctionGraph);   // drop the now-C++ function
+FKismetEditorUtilities::CompileBlueprint(Blueprint);
+```
+
+### Move 4 — Swap a member variable's type / storage
+
+```cpp
+FEdGraphPinType T;
+T.PinCategory = UEdGraphSchema_K2::PC_Struct;
+T.PinSubCategoryObject = FMyData::StaticStruct();
+T.ContainerType = EPinContainerType::Array;
+FBlueprintEditorUtils::RemoveMemberVariable(Blueprint, TEXT("LegacyArray"));  // S_LegacyData[]
+FBlueprintEditorUtils::AddMemberVariable(Blueprint, TEXT("Items"), T);            // FMyData[]
+FBlueprintEditorUtils::ReplaceVariableReferences(Blueprint, TEXT("LegacyArray"), TEXT("Items"));
+```
+(References whose pin *type* also changed still need Move-2 converters at their use sites.)
+
+### Always — verify the edit (closed loop)
+
+An edit is "done" only when both hold:
+1. `FKismetEditorUtilities::CompileBlueprint` is clean — **a failed compile is a hard stop; never
+   `SavePackages` a non-compiling blueprint.**
+2. Re-run the *read* path on the same BP and diff the new `graph.json` against the intended result.
+
+Run on a branch and commit per asset (or per op batch) so any bad edit is trivially reverted. Use
+only the non-UI APIs (avoid `Open*Menu` variants) so it stays headless.

@@ -15,7 +15,16 @@
 #include "K2Node.h"
 #include "K2Node_CallFunction.h"
 #include "K2Node_Variable.h"
+#include "K2Node_VariableGet.h"
 #include "K2Node_Event.h"
+
+// Write-side (programmatic blueprint editing) APIs.
+#include "Kismet2/KismetEditorUtilities.h"
+#include "Kismet2/BlueprintEditorUtils.h"
+#include "EdGraphSchema_K2.h"
+#include "Engine/BlueprintGeneratedClass.h"
+#include "Kismet/KismetMathLibrary.h"
+#include "GameFramework/Pawn.h"
 
 #include "ScriptDisassembler.h"
 
@@ -122,6 +131,20 @@ UBlueprintOracleCommandlet::UBlueprintOracleCommandlet()
 
 int32 UBlueprintOracleCommandlet::Main(const FString& Params)
 {
+	// -selftest : prove the programmatic-edit loop end-to-end on a disposable
+	// in-memory blueprint (no live assets touched). Returns non-zero on failure.
+	if (FParse::Param(*Params, TEXT("selftest")))
+	{
+		FString OutDirSelf;
+		FParse::Value(*Params, TEXT("out="), OutDirSelf);
+		if (OutDirSelf.IsEmpty())
+		{
+			OutDirSelf = FPaths::ProjectSavedDir() / TEXT("BlueprintOracle");
+		}
+		IFileManager::Get().MakeDirectory(*OutDirSelf, /*Tree*/ true);
+		return RunSelfTest(OutDirSelf);
+	}
+
 	TArray<FString> AssetPaths;
 
 	// -dir=/MountPoint : enumerate every Blueprint under a content path via the
@@ -556,4 +579,114 @@ void UBlueprintOracleCommandlet::WriteEnum(UUserDefinedEnum* Enum, const FString
 
 	SaveJson(Root, OutPath);
 	UE_LOG(LogBlueprintOracle, Display, TEXT("  wrote enum.json (%d entries)"), Entries.Num());
+}
+
+int32 UBlueprintOracleCommandlet::RunSelfTest(const FString& OutDir)
+{
+	int32 Failures = 0;
+	auto Check = [&Failures](bool bCond, const TCHAR* Desc)
+	{
+		if (bCond)
+		{
+			UE_LOG(LogBlueprintOracle, Display, TEXT("  [PASS] %s"), Desc);
+		}
+		else
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("  [FAIL] %s"), Desc);
+			++Failures;
+		}
+	};
+
+	UE_LOG(LogBlueprintOracle, Display, TEXT("BlueprintOracle self-test (programmatic editing) ..."));
+
+	// 1. Create a disposable blueprint (transient package, never saved to disk).
+	UPackage* Pkg = CreatePackage(TEXT("/Temp/__BPOracleSelfTest"));
+	Pkg->SetFlags(RF_Transient);
+	UBlueprint* Blueprint = FKismetEditorUtilities::CreateBlueprint(
+		AActor::StaticClass(), Pkg, FName("BP_OracleSelfTest"),
+		BPTYPE_Normal, UBlueprint::StaticClass(), UBlueprintGeneratedClass::StaticClass());
+	Check(Blueprint != nullptr, TEXT("create blueprint"));
+	if (!Blueprint)
+	{
+		return 1;
+	}
+
+	// 2. Add a float member variable.
+	FEdGraphPinType FloatType;
+	FloatType.PinCategory = UEdGraphSchema_K2::PC_Real;
+	FloatType.PinSubCategory = UEdGraphSchema_K2::PC_Float;
+	const bool bAddedVar = FBlueprintEditorUtils::AddMemberVariable(Blueprint, FName("TestFloat"), FloatType);
+	Check(bAddedVar, TEXT("add member variable 'TestFloat'"));
+
+	// 3. Reparent AActor -> APawn.
+	Blueprint->ParentClass = APawn::StaticClass();
+	FBlueprintEditorUtils::RefreshAllNodes(Blueprint);
+	Check(Blueprint->ParentClass == APawn::StaticClass(), TEXT("reparent to APawn"));
+
+	// 4. Spawn a VariableGet(TestFloat) and a CallFunction(Abs), wire get -> Abs.A.
+	UEdGraph* EventGraph = (Blueprint->UbergraphPages.Num() > 0) ? Blueprint->UbergraphPages[0] : nullptr;
+	Check(EventGraph != nullptr, TEXT("event graph exists"));
+	if (!EventGraph)
+	{
+		return 1;
+	}
+
+	UK2Node_VariableGet* GetNode = nullptr;
+	{
+		FGraphNodeCreator<UK2Node_VariableGet> Creator(*EventGraph);
+		GetNode = Creator.CreateNode();
+		GetNode->VariableReference.SetSelfMember(FName("TestFloat"));
+		GetNode->NodePosX = 0;
+		GetNode->NodePosY = 400;
+		Creator.Finalize();
+	}
+	UK2Node_CallFunction* CallNode = nullptr;
+	{
+		FGraphNodeCreator<UK2Node_CallFunction> Creator(*EventGraph);
+		CallNode = Creator.CreateNode();
+		CallNode->FunctionReference.SetExternalMember(FName("Abs"), UKismetMathLibrary::StaticClass());
+		CallNode->NodePosX = 300;
+		CallNode->NodePosY = 400;
+		Creator.Finalize();
+	}
+	Check(GetNode != nullptr && CallNode != nullptr, TEXT("spawn VariableGet + CallFunction nodes"));
+
+	UEdGraphPin* GetOut = GetNode ? GetNode->FindPin(FName("TestFloat"), EGPD_Output) : nullptr;
+	UEdGraphPin* AbsA = CallNode ? CallNode->FindPin(FName("A"), EGPD_Input) : nullptr;
+	Check(GetOut != nullptr && AbsA != nullptr, TEXT("locate value pins (TestFloat out, Abs.A in)"));
+	if (GetOut && AbsA)
+	{
+		GetOut->MakeLinkTo(AbsA);
+		Check(AbsA->LinkedTo.Contains(GetOut), TEXT("wire TestFloat -> Abs.A"));
+	}
+
+	// 5. THE AUTO-REWIRE: redirect the call Abs -> Sqrt (same param 'A'),
+	//    reconstruct, and confirm the wire reconnected purely by pin name.
+	if (CallNode)
+	{
+		CallNode->FunctionReference.SetExternalMember(FName("Sqrt"), UKismetMathLibrary::StaticClass());
+		CallNode->ReconstructNode();
+		UEdGraphPin* SqrtA = CallNode->FindPin(FName("A"), EGPD_Input);
+		UEdGraphPin* GetOutAfter = GetNode ? GetNode->FindPin(FName("TestFloat"), EGPD_Output) : nullptr;
+		Check(SqrtA != nullptr && GetOutAfter != nullptr && SqrtA->LinkedTo.Contains(GetOutAfter),
+			TEXT("AUTO-REWIRE: TestFloat -> A wire survived Abs->Sqrt redirect + ReconstructNode"));
+		Check(CallNode->FunctionReference.GetMemberName() == FName("Sqrt"),
+			TEXT("call node now targets Sqrt"));
+	}
+
+	// 6. Compile.
+	FKismetEditorUtilities::CompileBlueprint(Blueprint);
+	Check(Blueprint->Status == BS_UpToDate || Blueprint->Status == BS_UpToDateWithWarnings,
+		TEXT("compile blueprint clean"));
+
+	// 7. Read it back through the oracle's own graph dump (closes the edit->read loop).
+	WriteGraphs(Blueprint, TEXT("BP_OracleSelfTest"), OutDir);
+	FString GraphJson;
+	const bool bRead = FFileHelper::LoadFileToString(GraphJson, *(OutDir / TEXT("BP_OracleSelfTest.graph.json")));
+	Check(bRead, TEXT("read back graph.json"));
+	Check(GraphJson.Contains(TEXT("Pawn")), TEXT("read-back reflects reparent to Pawn"));
+	Check(GraphJson.Contains(TEXT("Sqrt")), TEXT("read-back reflects redirected call (Sqrt)"));
+
+	UE_LOG(LogBlueprintOracle, Display, TEXT("Self-test complete: %d failure(s)."), Failures);
+	return Failures == 0 ? 0 : 1;
 }

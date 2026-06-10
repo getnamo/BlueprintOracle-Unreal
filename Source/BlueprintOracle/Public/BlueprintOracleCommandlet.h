@@ -62,4 +62,14 @@ private:
 
 	/** Dump a UserDefinedEnum's entries (authored name, display name, value). */
 	void WriteEnum(UUserDefinedEnum* Enum, const FString& OutPath);
+
+	/**
+	 * Proof-of-concept for programmatic blueprint editing. Builds a disposable
+	 * in-memory blueprint and exercises the write-side APIs end-to-end:
+	 * create, add variable, reparent, spawn + wire a function-call node, redirect
+	 * the call to a different function (auto-rewire via ReconstructNode), compile,
+	 * and read it back via the oracle's own graph dump. Touches no live assets.
+	 * Returns 0 if every check passes, 1 otherwise.
+	 */
+	int32 RunSelfTest(const FString& OutDir);
 };

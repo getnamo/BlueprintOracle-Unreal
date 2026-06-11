@@ -21,6 +21,7 @@
 #include "K2Node_BreakStruct.h"
 #include "K2Node_MakeStruct.h"
 #include "K2Node_CallDelegate.h"
+#include "K2Node_DynamicCast.h"
 #include "K2Node_FunctionEntry.h"
 #include "K2Node_FunctionResult.h"
 #include "K2Node_EditablePinBase.h"
@@ -777,6 +778,19 @@ namespace
 			UE_LOG(LogBlueprintOracle, Error, TEXT("    buildBody: unknown node ref '%s'"), *Ref);
 			return nullptr;
 		}
+		// DynamicCast: its result object pin is named "As<ClassName>" (awkward to spell in a spec),
+		// so accept "result"/"out" for the cast-result output and "Object"/"in" for the source input.
+		if (UK2Node_DynamicCast* DC = Cast<UK2Node_DynamicCast>(*Node))
+		{
+			if (Dir == EGPD_Output && (PinName == TEXT("result") || PinName == TEXT("out") || PinName == TEXT("ReturnValue")))
+			{
+				return DC->GetCastResultPin();
+			}
+			if (Dir == EGPD_Input && (PinName == TEXT("Object") || PinName == TEXT("in")))
+			{
+				return DC->GetCastSourcePin();
+			}
+		}
 		if (UEdGraphPin* Pin = (*Node)->FindPin(FName(*PinName), Dir))
 		{
 			return Pin;
@@ -1093,6 +1107,25 @@ bool UBlueprintOracleCommandlet::ApplyMigrationOp(UBlueprint* Blueprint, const T
 						C.Finalize();
 						Created = Node;
 					}
+				}
+				else if (Kind == TEXT("cast"))
+				{
+					// Pure DynamicCast (no exec pins) for a data-path downcast, e.g. a C++ AActor*
+					// return -> a BP-typed (WR_ItemMaster) pin. "to" = target class path. Link the
+					// object in via "<id>:Object" and the result out via "<id>:result".
+					UClass* ToCls = ResolveClass(NObj->GetStringField(TEXT("to")));
+					if (!ToCls)
+					{
+						UE_LOG(LogBlueprintOracle, Error, TEXT("    buildBody: cannot resolve cast target class for node '%s'"), *Id);
+						return false;
+					}
+					FGraphNodeCreator<UK2Node_DynamicCast> C(*Graph);
+					UK2Node_DynamicCast* Node = C.CreateNode();
+					Node->TargetType = ToCls;
+					Node->SetPurity(true); // pure (data-only) cast - no exec pins
+					Node->NodePosX = 400; Node->NodePosY = PosY;
+					C.Finalize();
+					Created = Node;
 				}
 				else if (Kind == TEXT("callDelegate"))
 				{

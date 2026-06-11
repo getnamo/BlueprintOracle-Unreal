@@ -7,6 +7,8 @@ Blueprints are binary visual graphs, which are awkward to diff, review, or feed 
 loads each Blueprint with the engine itself (so deserialization is always correct and version-accurate) and
 exports a clean, text-friendly representation of its full logic.
 
+[Discord Server](https://discord.gg/qfJUyxaW4s)
+
 ## What it emits
 
 Per Blueprint, into your chosen output directory (all UTF-8):

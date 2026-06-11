@@ -1219,6 +1219,45 @@ bool UBlueprintOracleCommandlet::ApplyMigrationOp(UBlueprint* Blueprint, const T
 		return InFail == 0;
 	}
 
+	if (OpName == TEXT("connectPins"))
+	{
+		// Connect two existing pins (exec or data), breaking the target pin's current links first.
+		// from/to = {node:<guid>, pin}. Used to rewire exec flow (e.g. bypass a removed loop).
+		const FString GraphName = Op->GetStringField(TEXT("graph"));
+		UEdGraph* Graph = FindGraphByName(Blueprint, GraphName);
+		if (!Graph)
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("    connectPins: graph '%s' not found"), *GraphName);
+			return false;
+		}
+		TMap<FString, UEdGraphNode*> ByGuid;
+		for (UEdGraphNode* N : Graph->Nodes) { if (N) { ByGuid.Add(N->NodeGuid.ToString(EGuidFormats::Digits), N); } }
+		auto FindPinByName = [&ByGuid](const TSharedPtr<FJsonObject>& Spec, EEdGraphPinDirection Dir) -> UEdGraphPin*
+		{
+			UEdGraphNode* const* NP = ByGuid.Find(Spec->GetStringField(TEXT("node")));
+			if (!NP || !*NP) { return nullptr; }
+			const FString PinName = Spec->GetStringField(TEXT("pin"));
+			if (UEdGraphPin* P = (*NP)->FindPin(FName(*PinName), Dir)) { return P; }
+			for (UEdGraphPin* P : (*NP)->Pins)
+			{
+				if (P && P->Direction == Dir && StripStructPinGuid(P->PinName.ToString()) == PinName) { return P; }
+			}
+			return nullptr;
+		};
+		UEdGraphPin* From = FindPinByName(Op->GetObjectField(TEXT("from")), EGPD_Output);
+		UEdGraphPin* To = FindPinByName(Op->GetObjectField(TEXT("to")), EGPD_Input);
+		if (!From || !To)
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("    connectPins: pin not found (from=%d to=%d)"), From != nullptr, To != nullptr);
+			return false;
+		}
+		To->BreakAllPinLinks();
+		From->MakeLinkTo(To);
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+		UE_LOG(LogBlueprintOracle, Display, TEXT("    connectPins ok"));
+		return true;
+	}
+
 	if (OpName == TEXT("addVar"))
 	{
 		// Add a member variable. Build the pin type from {category, struct?/class?, container?}.

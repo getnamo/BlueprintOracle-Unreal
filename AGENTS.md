@@ -247,6 +247,7 @@ reports every asset's error/warning count without touching disk — always dry-r
 | `addVar` | `name`, `category`, `struct?`/`class?`/`sub?`, `container?` | `AddMemberVariable` with a pin type built from the spec (category = bool/int/byte/real(+sub)/name/string/text/struct/object/class; `container` = Array/Set). | 4 |
 | `removeNode` | `graph`, `node` (guid) | remove a node from a graph (e.g. an orphaned `BreakStruct` after a `spliceCall` retarget). | — |
 | `retargetVarRef` | `graph`, `node` (guid), `toVar`, `toClass?` | point a `VariableGet`/`VariableSet` at a different member (`toClass` external, else self) + `ReconstructNode` so its value pin takes the new type. E.g. swap a read of a legacy array member for an inherited canonical one. | 4 |
+| `connectPins` | `graph`, `from` (`{node,pin}`), `to` (`{node,pin}`) | connect two existing pins (exec or data), breaking the `to` pin's current links first. E.g. rewire exec flow to bypass a removed loop. | — |
 
 `graph?` (optional) restricts an op to one named graph; omit to apply across all graphs of the asset.
 

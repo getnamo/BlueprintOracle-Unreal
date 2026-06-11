@@ -252,6 +252,8 @@ reports every asset's error/warning count without touching disk — always dry-r
 
 `graph?` (optional) restricts an op to one named graph; omit to apply across all graphs of the asset.
 
+**Content fix (DataTables, not Blueprints):** `-settablefield -table=<path> -row=<name> -field=<authoredName> -value=<int> [-commit]` sets a byte/enum/int field on a DataTable row (top-level or one level of nested struct, matched by authored name) and saves the `.uasset`. Dry-run by default. For correcting content like an item's `EquippedSlot`.
+
 **Ordering matters.** Do removals *before* a reparent so same-named C++ functions on the new parent
 don't collide with the BP graphs mid-apply; reparent last. Reads cleanest as: strip what C++ owns,
 then reparent onto it.

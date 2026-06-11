@@ -216,6 +216,74 @@ int32 UBlueprintOracleCommandlet::Main(const FString& Params)
 		return RunMigration(SpecPath, bCommit);
 	}
 
+	// -settablefield -table=<path> -row=<name> -field=<authoredName> -value=<int> [-commit]
+	// Set a byte/enum/int field on a DataTable row (top-level or one level of nested struct,
+	// matched by authored name). For correcting content like an item's EquippedSlot. Dry-run
+	// by default (reports without saving); -commit writes the .uasset.
+	if (FParse::Param(*Params, TEXT("settablefield")))
+	{
+		FString TablePath, RowName, FieldName, ValueStr;
+		FParse::Value(*Params, TEXT("table="), TablePath);
+		FParse::Value(*Params, TEXT("row="), RowName);
+		FParse::Value(*Params, TEXT("field="), FieldName);
+		FParse::Value(*Params, TEXT("value="), ValueStr);
+		const bool bCommit = FParse::Param(*Params, TEXT("commit"));
+		if (TablePath.IsEmpty() || RowName.IsEmpty() || FieldName.IsEmpty() || ValueStr.IsEmpty())
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("-settablefield needs -table -row -field -value."));
+			return 1;
+		}
+		UDataTable* Table = LoadObject<UDataTable>(nullptr, *TablePath);
+		const UScriptStruct* RowStruct = Table ? Table->GetRowStruct() : nullptr;
+		uint8* Row = RowStruct ? Table->FindRowUnchecked(FName(*RowName)) : nullptr;
+		if (!Row)
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("-settablefield: row '%s' not found in '%s'"), *RowName, *TablePath);
+			return 1;
+		}
+		const int64 NewValue = FCString::Atoi64(*ValueStr);
+		auto SetField = [](UStruct* S, void* Container, const FString& N, int64 V) -> bool
+		{
+			for (TFieldIterator<FProperty> It(S); It; ++It)
+			{
+				if (It->GetAuthoredName() != N) { continue; }
+				if (FByteProperty* BP = CastField<FByteProperty>(*It)) { BP->SetPropertyValue_InContainer(Container, (uint8)V); return true; }
+				if (FEnumProperty* EP = CastField<FEnumProperty>(*It)) { EP->GetUnderlyingProperty()->SetIntPropertyValue(EP->ContainerPtrToValuePtr<void>(Container), V); return true; }
+				if (FIntProperty* IP = CastField<FIntProperty>(*It)) { IP->SetPropertyValue_InContainer(Container, (int32)V); return true; }
+			}
+			return false;
+		};
+		bool bSet = SetField(const_cast<UScriptStruct*>(RowStruct), Row, FieldName, NewValue);
+		for (TFieldIterator<FProperty> It(RowStruct); It && !bSet; ++It)
+		{
+			if (FStructProperty* SP = CastField<FStructProperty>(*It))
+			{
+				bSet = SetField(SP->Struct, SP->ContainerPtrToValuePtr<void>(Row), FieldName, NewValue);
+			}
+		}
+		if (!bSet)
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("-settablefield: field '%s' not found on row '%s'"), *FieldName, *RowName);
+			return 1;
+		}
+		UE_LOG(LogBlueprintOracle, Display, TEXT("-settablefield: %s[%s].%s = %lld (%s)"),
+			*TablePath, *RowName, *FieldName, NewValue, bCommit ? TEXT("COMMIT") : TEXT("DRY-RUN"));
+		if (bCommit)
+		{
+			UPackage* Package = Table->GetOutermost();
+			Package->MarkPackageDirty();
+			const FString FileName = FPackageName::LongPackageNameToFilename(Package->GetName(), FPackageName::GetAssetPackageExtension());
+			FPlatformFileManager::Get().GetPlatformFile().SetReadOnly(*FileName, false);
+			FSavePackageArgs SaveArgs;
+			SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+			SaveArgs.SaveFlags = SAVE_NoError;
+			const FSavePackageResultStruct Result = UPackage::Save(Package, nullptr, *FileName, SaveArgs);
+			UE_LOG(LogBlueprintOracle, Display, TEXT("  %s %s"), Result.IsSuccessful() ? TEXT("SAVED") : TEXT("SAVE FAILED"), *FileName);
+			return Result.IsSuccessful() ? 0 : 1;
+		}
+		return 0;
+	}
+
 	TArray<FString> AssetPaths;
 
 	// -dir=/MountPoint : enumerate every Blueprint under a content path via the

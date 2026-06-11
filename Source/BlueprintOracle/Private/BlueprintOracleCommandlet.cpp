@@ -22,6 +22,7 @@
 #include "K2Node_MakeStruct.h"
 #include "K2Node_CallDelegate.h"
 #include "K2Node_DynamicCast.h"
+#include "K2Node_IfThenElse.h"
 #include "K2Node_FunctionEntry.h"
 #include "K2Node_FunctionResult.h"
 #include "K2Node_EditablePinBase.h"
@@ -1123,6 +1124,16 @@ bool UBlueprintOracleCommandlet::ApplyMigrationOp(UBlueprint* Blueprint, const T
 					UK2Node_DynamicCast* Node = C.CreateNode();
 					Node->TargetType = ToCls;
 					Node->SetPurity(true); // pure (data-only) cast - no exec pins
+					Node->NodePosX = 400; Node->NodePosY = PosY;
+					C.Finalize();
+					Created = Node;
+				}
+				else if (Kind == TEXT("branch"))
+				{
+					// K2Node_IfThenElse. Pins: execute (in exec), Condition (in bool),
+					// then / else (out exec). Standard names - no special pin resolution needed.
+					FGraphNodeCreator<UK2Node_IfThenElse> C(*Graph);
+					UK2Node_IfThenElse* Node = C.CreateNode();
 					Node->NodePosX = 400; Node->NodePosY = PosY;
 					C.Finalize();
 					Created = Node;

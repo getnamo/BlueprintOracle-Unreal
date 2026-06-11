@@ -23,6 +23,7 @@
 #include "K2Node_CallDelegate.h"
 #include "K2Node_FunctionEntry.h"
 #include "K2Node_FunctionResult.h"
+#include "K2Node_EditablePinBase.h"
 
 // Write-side (programmatic blueprint editing) APIs.
 #include "Kismet2/KismetEditorUtilities.h"
@@ -1256,6 +1257,59 @@ bool UBlueprintOracleCommandlet::ApplyMigrationOp(UBlueprint* Blueprint, const T
 		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 		UE_LOG(LogBlueprintOracle, Display, TEXT("    connectPins ok"));
 		return true;
+	}
+
+	// Build an FEdGraphPinType from a spec object's {category, struct?/class?/sub?, container?}.
+	auto BuildPinType = [this](const TSharedPtr<FJsonObject>& Spec, FEdGraphPinType& T) -> bool
+	{
+		const FString Category = Spec->GetStringField(TEXT("category"));
+		if (Category == TEXT("struct")) { T.PinCategory = UEdGraphSchema_K2::PC_Struct; T.PinSubCategoryObject = ResolveStruct(Spec->GetStringField(TEXT("struct"))); }
+		else if (Category == TEXT("object")) { T.PinCategory = UEdGraphSchema_K2::PC_Object; T.PinSubCategoryObject = ResolveClass(Spec->GetStringField(TEXT("class"))); }
+		else if (Category == TEXT("class")) { T.PinCategory = UEdGraphSchema_K2::PC_Class; T.PinSubCategoryObject = ResolveClass(Spec->GetStringField(TEXT("class"))); }
+		else if (Category == TEXT("real")) { FString S; T.PinCategory = UEdGraphSchema_K2::PC_Real; T.PinSubCategory = (Spec->TryGetStringField(TEXT("sub"), S) && S == TEXT("float")) ? UEdGraphSchema_K2::PC_Float : UEdGraphSchema_K2::PC_Double; }
+		else if (Category == TEXT("bool")) { T.PinCategory = UEdGraphSchema_K2::PC_Boolean; }
+		else if (Category == TEXT("int")) { T.PinCategory = UEdGraphSchema_K2::PC_Int; }
+		else if (Category == TEXT("byte")) { T.PinCategory = UEdGraphSchema_K2::PC_Byte; }
+		else if (Category == TEXT("name")) { T.PinCategory = UEdGraphSchema_K2::PC_Name; }
+		else if (Category == TEXT("string")) { T.PinCategory = UEdGraphSchema_K2::PC_String; }
+		else if (Category == TEXT("text")) { T.PinCategory = UEdGraphSchema_K2::PC_Text; }
+		else { UE_LOG(LogBlueprintOracle, Error, TEXT("    unsupported category '%s'"), *Category); return false; }
+		FString Container;
+		if (Spec->TryGetStringField(TEXT("container"), Container))
+		{
+			if (Container == TEXT("Array")) { T.ContainerType = EPinContainerType::Array; }
+			else if (Container == TEXT("Set")) { T.ContainerType = EPinContainerType::Set; }
+		}
+		return true;
+	};
+
+	if (OpName == TEXT("retypeParam"))
+	{
+		// Change a BP function's parameter type: locate the FunctionEntry (inputs) / FunctionResult
+		// (outputs) editable pins by name, set the new type, ReconstructNode. NOTE: this changes the
+		// function signature - the function's CALL SITES then need their (now type-mismatched) wires
+		// fixed (splice converters/accessors) in the same migration for a clean compile.
+		const FString GraphName = Op->GetStringField(TEXT("graph"));
+		UEdGraph* Graph = FindGraphByName(Blueprint, GraphName);
+		if (!Graph) { UE_LOG(LogBlueprintOracle, Error, TEXT("    retypeParam: graph '%s' not found"), *GraphName); return false; }
+		const FName ParamName(*Op->GetStringField(TEXT("param")));
+		FEdGraphPinType T;
+		if (!BuildPinType(Op, T)) { return false; }
+		int32 Changed = 0;
+		for (UEdGraphNode* N : Graph->Nodes)
+		{
+			UK2Node_EditablePinBase* Editable = Cast<UK2Node_EditablePinBase>(N);
+			if (!Editable) { continue; }
+			bool bThisNode = false;
+			for (TSharedPtr<FUserPinInfo>& P : Editable->UserDefinedPins)
+			{
+				if (P.IsValid() && P->PinName == ParamName) { P->PinType = T; ++Changed; bThisNode = true; }
+			}
+			if (bThisNode) { Editable->ReconstructNode(); }
+		}
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+		UE_LOG(LogBlueprintOracle, Display, TEXT("    retypeParam '%s' in '%s': %d pin(s) retyped"), *ParamName.ToString(), *GraphName, Changed);
+		return Changed > 0;
 	}
 
 	if (OpName == TEXT("addVar"))

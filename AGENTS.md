@@ -301,8 +301,8 @@ tail node's `then` into the appended chain. Pin names use the authored-prefix fa
 pins resolve by clean name). Reports `N node(s), M link(s) ok, K failed` — a non-zero `failed` means a
 pin/ref didn't resolve.
 
-**Use replace** to gut a 100-node graph down to a single C++ call (e.g. `EquipItemByDefinition` →
-`EquipItemByMirrorIndex` + a `cast`). **Use append** to add behavior to a working graph without
+**Use replace** to gut a 100-node graph down to a single C++ call (e.g. `SomeFunction` →
+`SomeFunctionMirrorIndex` + a `cast`). **Use append** to add behavior to a working graph without
 disturbing it (e.g. add an equipped-state indicator to a widget's `SetUI`: append `variableGet ItemID →
 breakStruct → branch(IsEquipped) → SetColorAndOpacity(self)`, wiring the existing tail node's `then` in).
 

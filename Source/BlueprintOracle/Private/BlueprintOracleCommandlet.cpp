@@ -23,6 +23,7 @@
 #include "K2Node_CallDelegate.h"
 #include "K2Node_DynamicCast.h"
 #include "K2Node_IfThenElse.h"
+#include "K2Node_VariableGet.h"
 #include "K2Node_FunctionEntry.h"
 #include "K2Node_FunctionResult.h"
 #include "K2Node_EditablePinBase.h"
@@ -1032,20 +1033,36 @@ bool UBlueprintOracleCommandlet::ApplyMigrationOp(UBlueprint* Blueprint, const T
 			if (UK2Node_FunctionResult* R = Cast<UK2Node_FunctionResult>(N)) { Result = R; }
 		}
 
-		// Strip the old body (everything but entry/result).
-		TArray<UEdGraphNode*> ToRemove;
-		for (UEdGraphNode* N : Graph->Nodes)
+		// "append": true keeps the existing body and adds nodes to it (links may reference the
+		// existing nodes by their 32-char GUID, as in graph.json); default REPLACES the body.
+		bool bAppend = false;
+		Op->TryGetBoolField(TEXT("append"), bAppend);
+		if (!bAppend)
 		{
-			if (N && N != Entry && N != Result) { ToRemove.Add(N); }
-		}
-		for (UEdGraphNode* N : ToRemove)
-		{
-			FBlueprintEditorUtils::RemoveNode(Blueprint, N, /*bDontRecompile*/ true);
+			// Strip the old body (everything but entry/result).
+			TArray<UEdGraphNode*> ToRemove;
+			for (UEdGraphNode* N : Graph->Nodes)
+			{
+				if (N && N != Entry && N != Result) { ToRemove.Add(N); }
+			}
+			for (UEdGraphNode* N : ToRemove)
+			{
+				FBlueprintEditorUtils::RemoveNode(Blueprint, N, /*bDontRecompile*/ true);
+			}
 		}
 
 		TMap<FString, UEdGraphNode*> NodeMap;
 		if (Entry) { NodeMap.Add(TEXT("$entry"), Entry); }
 		if (Result) { NodeMap.Add(TEXT("$result"), Result); }
+		if (bAppend)
+		{
+			// Let links target the preserved nodes by GUID (e.g. wire an existing tail node's
+			// "then" into the appended chain).
+			for (UEdGraphNode* N : Graph->Nodes)
+			{
+				if (N) { NodeMap.Add(N->NodeGuid.ToString(EGuidFormats::Digits), N); }
+			}
+		}
 
 		UClass* SkelClass = Blueprint->SkeletonGeneratedClass ? Blueprint->SkeletonGeneratedClass : Blueprint->GeneratedClass;
 
@@ -1125,6 +1142,17 @@ bool UBlueprintOracleCommandlet::ApplyMigrationOp(UBlueprint* Blueprint, const T
 					Node->TargetType = ToCls;
 					Node->SetPurity(true); // pure (data-only) cast - no exec pins
 					Node->NodePosX = 400; Node->NodePosY = PosY;
+					C.Finalize();
+					Created = Node;
+				}
+				else if (Kind == TEXT("variableGet"))
+				{
+					// Read a member variable (self). Output pin is named after the variable, e.g.
+					// {"kind":"variableGet","var":"ItemID"} -> link "<id>:ItemID".
+					FGraphNodeCreator<UK2Node_VariableGet> C(*Graph);
+					UK2Node_VariableGet* Node = C.CreateNode();
+					Node->VariableReference.SetSelfMember(FName(*NObj->GetStringField(TEXT("var"))));
+					Node->NodePosX = 100; Node->NodePosY = PosY;
 					C.Finalize();
 					Created = Node;
 				}

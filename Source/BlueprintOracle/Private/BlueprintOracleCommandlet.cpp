@@ -1498,8 +1498,24 @@ bool UBlueprintOracleCommandlet::ApplyMigrationOp(UBlueprint* Blueprint, const T
 			else if (Container == TEXT("Set")) { T.ContainerType = EPinContainerType::Set; }
 		}
 		const bool bOk = FBlueprintEditorUtils::AddMemberVariable(Blueprint, FName(*VarName), T);
-		UE_LOG(LogBlueprintOracle, Display, TEXT("    addVar '%s' (%s%s) -> %s"),
+		// Optionally mark the new variable Expose-on-Spawn so it surfaces as a pin on
+		// CreateWidget/SpawnActor/ConstructObject callers (instance-editable + CPF_ExposeOnSpawn +
+		// the "ExposeOnSpawn" metadata, mirroring what the BP var editor's checkbox does).
+		bool bExposeOnSpawn = false;
+		if (bOk && Op->TryGetBoolField(TEXT("exposeOnSpawn"), bExposeOnSpawn) && bExposeOnSpawn)
+		{
+			const int32 VarIndex = FBlueprintEditorUtils::FindNewVariableIndex(Blueprint, FName(*VarName));
+			if (VarIndex != INDEX_NONE)
+			{
+				Blueprint->NewVariables[VarIndex].PropertyFlags &= ~CPF_DisableEditOnInstance;
+				Blueprint->NewVariables[VarIndex].PropertyFlags |= CPF_ExposeOnSpawn | CPF_BlueprintVisible;
+			}
+			FBlueprintEditorUtils::SetBlueprintVariableMetaData(
+				Blueprint, FName(*VarName), nullptr, FName(TEXT("ExposeOnSpawn")), TEXT("true"));
+		}
+		UE_LOG(LogBlueprintOracle, Display, TEXT("    addVar '%s' (%s%s%s) -> %s"),
 			*VarName, *Category, T.ContainerType == EPinContainerType::Array ? TEXT("[]") : TEXT(""),
+			bExposeOnSpawn ? TEXT(", exposeOnSpawn") : TEXT(""),
 			bOk ? TEXT("ok") : TEXT("FAILED"));
 		return bOk;
 	}

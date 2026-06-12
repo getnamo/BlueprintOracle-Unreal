@@ -249,10 +249,62 @@ reports every asset's error/warning count without touching disk — always dry-r
 | `retargetVarRef` | `graph`, `node` (guid), `toVar`, `toClass?` | point a `VariableGet`/`VariableSet` at a different member (`toClass` external, else self) + `ReconstructNode` so its value pin takes the new type. E.g. swap a read of a legacy array member for an inherited canonical one. | 4 |
 | `connectPins` | `graph`, `from` (`{node,pin}`), `to` (`{node,pin}`) | connect two existing pins (exec or data), breaking the `to` pin's current links first. E.g. rewire exec flow to bypass a removed loop. | — |
 | `retypeParam` | `graph`, `param`, `category`, `struct?`/`class?`/`sub?`, `container?` | change a BP function's parameter type (FunctionEntry inputs / FunctionResult outputs editable pins) + `ReconstructNode`. **Changes the function signature** — the call sites' now-mismatched wires must be fixed (splice converters) in the same migration for a clean compile. | 4 |
+| `buildBody` | `graph`, `nodes[]`, `links[]`, `append?` | author a function body from a node+link spec (see §buildBody). Default **replaces** the body (keeps entry/result); `append:true` **adds to** the existing body. The general node-graph authoring op. | 2/4 |
 
 `graph?` (optional) restricts an op to one named graph; omit to apply across all graphs of the asset.
 
 **Content fix (DataTables, not Blueprints):** `-settablefield -table=<path> -row=<name> -field=<authoredName> -value=<int> [-commit]` sets a byte/enum/int field on a DataTable row (top-level or one level of nested struct, matched by authored name) and saves the `.uasset`. Dry-run by default. For correcting content like an item's `EquippedSlot`.
+
+### buildBody — author/extend a function body from a node spec
+
+The general graph-authoring op. It rebuilds (or, with `append:true`, extends) a function graph from a
+declarative `nodes[]` + `links[]` spec — so you can lay down a small subgraph (a call chain, a branch, a
+converter) without hand-writing `FGraphNodeCreator` C++. Replace mode keeps only the FunctionEntry/Result
+and strips the rest; append mode keeps the whole body and adds to it.
+
+```jsonc
+{ "op": "buildBody", "graph": "MyFunction",
+  "append": false,                              // false (default) = replace body; true = add to it
+  "nodes": [
+    { "id": "call", "kind": "callFunction", "self": true, "member": "DoThing" },
+    { "id": "br",   "kind": "branch" },
+    { "id": "cast", "kind": "cast", "to": "/Game/BP_Foo.BP_Foo_C" },
+    { "id": "name", "kind": "variableGet", "var": "ItemID" },
+    { "id": "mk",   "kind": "makeStruct", "struct": "/Script/CoreUObject.LinearColor",
+      "defaults": [ { "pin": "R", "value": "1.0" } ] }
+  ],
+  "links": [
+    { "from": "$entry:then", "to": "call:execute" },
+    { "from": "call:then",   "to": "$result:execute" },
+    { "from": "name:ItemID", "to": "cast:Object" }
+  ]
+}
+```
+
+**Node `kind`s:**
+
+| kind | fields | makes / output pin |
+|---|---|---|
+| `callFunction` | `member`, `self:true` *or* `class` (path) | a `CallFunction`. Self-member or external. |
+| `breakStruct` / `makeStruct` | `struct` (path), `defaults?` | break/make a struct. UserDefinedStruct member pins are matched by **authored field-name prefix** (the `Field_<idx>_<guid>` suffix is stripped), so reference `IsEquipped`, not the mangled name. |
+| `callDelegate` | `delegate` (name), `defaults?` | call a multicast delegate (`SetFromProperty`, self-context). |
+| `cast` | `to` (class path) | a **pure** `DynamicCast`. Link the object in via `<id>:Object`, the result out via `<id>:result` (the awkward `As<Class>` pin name is aliased). For a C++ `AActor*`→BP-typed downcast. |
+| `branch` | — | a `K2Node_IfThenElse`. Pins: `execute` (in), `Condition` (in bool), `then` / `else` (out). |
+| `variableGet` | `var` (name) | a self-member `VariableGet`; **output pin is the variable name** (`<id>:ItemID`). |
+
+**Per-node `defaults`:** `[{ "pin": "<name>", "value": "<literal>" }]` writes a pin's literal default (incl.
+struct literals like `(R=1.0,G=0.8,B=0.3,A=1.0)`), via the schema's `TrySetDefaultValue`.
+
+**Link refs** (`"nodeRef:pinName"`): node refs are `$entry`, `$result`, a spec `id`, or — **in `append`
+mode only** — an existing node's 32-char GUID (as emitted in `graph.json`), so you can wire an existing
+tail node's `then` into the appended chain. Pin names use the authored-prefix fallback (so struct member
+pins resolve by clean name). Reports `N node(s), M link(s) ok, K failed` — a non-zero `failed` means a
+pin/ref didn't resolve.
+
+**Use replace** to gut a 100-node graph down to a single C++ call (e.g. `EquipItemByDefinition` →
+`EquipItemByMirrorIndex` + a `cast`). **Use append** to add behavior to a working graph without
+disturbing it (e.g. add an equipped-state indicator to a widget's `SetUI`: append `variableGet ItemID →
+breakStruct → branch(IsEquipped) → SetColorAndOpacity(self)`, wiring the existing tail node's `then` in).
 
 **Ordering matters.** Do removals *before* a reparent so same-named C++ functions on the new parent
 don't collide with the BP graphs mid-apply; reparent last. Reads cleanest as: strip what C++ owns,

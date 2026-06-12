@@ -69,6 +69,33 @@ UnrealEditor-Cmd.exe <Project>.uproject -run=BlueprintOracle -selftest -unattend
 
 It reports `[PASS]/[FAIL]` for each step and returns non-zero on any failure.
 
+### Declarative migrations (`-migrate`)
+
+The practical interface for editing is a **compile-gated, declarative migration spec** — a JSON list of
+assets, each with an ordered list of ops. Each asset is loaded, its ops applied, `RefreshAllNodes`'d, then
+compiled; it is saved only on **0 errors** and only with `-commit`. Dry-run (the default) reports the
+compile result without touching disk.
+
+```
+UnrealEditor-Cmd.exe <Project>.uproject -run=BlueprintOracle -migrate -spec="<path>.json" \
+    -unattended -nullrhi -nosplash -nopause -log        # dry run: edit in memory, compile, report
+    ... -migrate -spec="<path>.json" -commit             # write .uasset(s), only if they compiled clean
+```
+
+```jsonc
+{ "assets": [ { "package": "/Game/Blueprints/BP_MyComponent", "ops": [
+    { "op": "removeGraph", "name": "DoThingBP" },
+    { "op": "reparent", "newParent": "/Script/MyModule.MyComponentBase" }
+] } ] }
+```
+
+Ops include: `reparent`, `removeGraph`, `removeVar`, `replaceVarRefs`, `redirectCall`, `setCallPinDefault`,
+`addVar`, `removeNode`, `retargetVarRef`, `connectPins`, `retypeParam`, `spliceCall` (drive a pin from a
+new call), and `buildBody` (author/extend a function body from a node+link spec — kinds `callFunction` /
+`breakStruct` / `makeStruct` / `callDelegate` / `cast` / `branch` / `variableGet`, with a replace or
+`append` mode). A separate `-settablefield` mode edits a DataTable row's field. **The full op reference,
+spec format, and the read→edit→verify workflow are in [`AGENTS.md`](AGENTS.md).**
+
 ### Verified editing API (UE 5.5)
 
 | Operation | API |

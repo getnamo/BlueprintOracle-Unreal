@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
 	"Version": 1,
-	"VersionName": "0.1.0",
+	"VersionName": "0.2.0",
 	"EngineVersion": "5.8.0",
 	"FriendlyName": "BlueprintOracle",
 	"Description": "Editor commandlet that dumps ground-truth Blueprint data to JSON/text (graph nodes + pins + connectivity, linker layout, and Kismet bytecode disassembly) for static analysis, documentation, and agent-assisted Blueprint-to-C++ conversion.",

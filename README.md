@@ -96,7 +96,7 @@ new call), and `buildBody` (author/extend a function body from a node+link spec 
 `append` mode). A separate `-settablefield` mode edits a DataTable row's field. **The full op reference,
 spec format, and the read→edit→verify workflow are in [`AGENTS.md`](AGENTS.md).**
 
-### Verified editing API (UE 5.5)
+### Verified editing API (UE 5.8)
 
 | Operation | API |
 |---|---|
@@ -128,7 +128,7 @@ wired call from `Abs` to `Sqrt` and confirming the input wire survives.
 
 ## Install
 
-Drop into your project's `Plugins/` folder (or add as a submodule) and enable it for the Editor target.
+Requires **UE 5.8+**. Drop into your project's `Plugins/` folder (or add as a submodule) and enable it for the Editor target.
 It depends only on engine modules (`UnrealEd`, `Kismet`, `BlueprintGraph`, `ScriptDisassembler`,
 `AssetRegistry`, `Json`).
 

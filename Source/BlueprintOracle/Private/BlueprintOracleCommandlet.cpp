@@ -180,7 +180,7 @@ int32 UBlueprintOracleCommandlet::Main(const FString& Params)
 			if (!Pkg) { UE_LOG(LogBlueprintOracle, Error, TEXT("Cannot load %s"), *TablePkg); continue; }
 			Pkg->FullyLoad();
 			TArray<UObject*> Objects;
-			GetObjectsWithOuter(Pkg, Objects, false);
+			GetObjectsWithOuter(Pkg, Objects, EGetObjectsFlags::None);
 			FString Name = TablePkg; Name.RemoveFromStart(TEXT("/")); Name.ReplaceInline(TEXT("/"), TEXT("_"));
 			for (UObject* Obj : Objects)
 			{
@@ -374,7 +374,7 @@ void UBlueprintOracleCommandlet::ProcessAsset(const FString& PackageName, const 
 	UBlueprint* Blueprint = nullptr;
 	{
 		TArray<UObject*> Objects;
-		GetObjectsWithOuter(Package, Objects, /*bIncludeNestedObjects*/ false);
+		GetObjectsWithOuter(Package, Objects, EGetObjectsFlags::None);
 		for (UObject* Obj : Objects)
 		{
 			Blueprint = Cast<UBlueprint>(Obj);
@@ -389,7 +389,7 @@ void UBlueprintOracleCommandlet::ProcessAsset(const FString& PackageName, const 
 	{
 		// Not a Blueprint - try UserDefinedStruct / UserDefinedEnum (item data models).
 		TArray<UObject*> Objects;
-		GetObjectsWithOuter(Package, Objects, /*bIncludeNestedObjects*/ false);
+		GetObjectsWithOuter(Package, Objects, EGetObjectsFlags::None);
 		for (UObject* Obj : Objects)
 		{
 			if (UUserDefinedStruct* Struct = Cast<UUserDefinedStruct>(Obj))
@@ -1630,7 +1630,7 @@ int32 UBlueprintOracleCommandlet::RunMigration(const FString& SpecPath, bool bCo
 		UBlueprint* Blueprint = nullptr;
 		{
 			TArray<UObject*> Objects;
-			GetObjectsWithOuter(Package, Objects, /*bIncludeNestedObjects*/ false);
+			GetObjectsWithOuter(Package, Objects, EGetObjectsFlags::None);
 			for (UObject* Obj : Objects)
 			{
 				Blueprint = Cast<UBlueprint>(Obj);

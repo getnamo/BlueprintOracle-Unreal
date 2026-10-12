@@ -898,7 +898,8 @@ bool UBlueprintOracleCommandlet::ApplyMigrationOp(UBlueprint* Blueprint, const T
 	if (OpName == TEXT("redirectCall"))
 	{
 		// Redirect every CallFunction node matching 'fromMember' to 'toMember' on
-		// 'toClass' (Move 1 auto-rewire). Optional 'graph' restricts to one graph.
+		// 'toClass' (Move 1 auto-rewire). Optional 'graph' restricts to one graph,
+		// optional 'node' (GUID, as in graph.json) to one call node.
 		const FString FromMember = Op->GetStringField(TEXT("fromMember"));
 		const FString ToMember = Op->GetStringField(TEXT("toMember"));
 		const FString ToClassPath = Op->GetStringField(TEXT("toClass"));
@@ -910,6 +911,8 @@ bool UBlueprintOracleCommandlet::ApplyMigrationOp(UBlueprint* Blueprint, const T
 		}
 		FString OnlyGraph;
 		Op->TryGetStringField(TEXT("graph"), OnlyGraph);
+		FString OnlyNode;
+		Op->TryGetStringField(TEXT("node"), OnlyNode);
 
 		TArray<UEdGraph*> Graphs;
 		Graphs.Append(Blueprint->UbergraphPages);
@@ -926,7 +929,8 @@ bool UBlueprintOracleCommandlet::ApplyMigrationOp(UBlueprint* Blueprint, const T
 			for (UEdGraphNode* Node : Graph->Nodes)
 			{
 				UK2Node_CallFunction* Call = Cast<UK2Node_CallFunction>(Node);
-				if (Call && Call->FunctionReference.GetMemberName() == FName(*FromMember))
+				if (Call && Call->FunctionReference.GetMemberName() == FName(*FromMember) &&
+					(OnlyNode.IsEmpty() || Call->NodeGuid.ToString(EGuidFormats::Digits) == OnlyNode))
 				{
 					Call->FunctionReference.SetExternalMember(FName(*ToMember), ToClass);
 					Call->ReconstructNode();
@@ -936,6 +940,11 @@ bool UBlueprintOracleCommandlet::ApplyMigrationOp(UBlueprint* Blueprint, const T
 		}
 		UE_LOG(LogBlueprintOracle, Display, TEXT("    redirectCall '%s' -> %s::%s (%d node(s))"),
 			*FromMember, *ToClass->GetName(), *ToMember, Count);
+		if (!OnlyNode.IsEmpty() && Count == 0)
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("    redirectCall: no '%s' call node with GUID '%s'"), *FromMember, *OnlyNode);
+			return false;
+		}
 		return true;
 	}
 
@@ -1332,6 +1341,20 @@ bool UBlueprintOracleCommandlet::ApplyMigrationOp(UBlueprint* Blueprint, const T
 		IntoPin->BreakAllPinLinks();
 		OutPin->MakeLinkTo(IntoPin);
 
+		// Place the new node: "pos" {x, y} if given, else just left of the node it drives
+		// (new nodes otherwise land at the graph origin, far from the wire they feed).
+		const TSharedPtr<FJsonObject>* PosObj = nullptr;
+		if (Op->TryGetObjectField(TEXT("pos"), PosObj))
+		{
+			Call->NodePosX = (int32)(*PosObj)->GetNumberField(TEXT("x"));
+			Call->NodePosY = (int32)(*PosObj)->GetNumberField(TEXT("y"));
+		}
+		else
+		{
+			Call->NodePosX = IntoNode->NodePosX - 300;
+			Call->NodePosY = IntoNode->NodePosY + 100;
+		}
+
 		// Wire the call's inputs from existing node output pins.
 		int32 InOk = 0, InFail = 0;
 		const TArray<TSharedPtr<FJsonValue>>* Inputs = nullptr;
@@ -1397,6 +1420,65 @@ bool UBlueprintOracleCommandlet::ApplyMigrationOp(UBlueprint* Blueprint, const T
 		From->MakeLinkTo(To);
 		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 		UE_LOG(LogBlueprintOracle, Display, TEXT("    connectPins ok"));
+		return true;
+	}
+
+	if (OpName == TEXT("breakLinks"))
+	{
+		// Break every link of one pin ({graph, node:<guid>, pin}). Any pin left orphaned and unlinked
+		// by this (the pin itself or the pins it was wired to) is removed, so a stale wire from a
+		// changed signature (e.g. a delegate param that no longer exists) can be cleared before
+		// connectPins wires the replacement.
+		const FString GraphName = Op->GetStringField(TEXT("graph"));
+		UEdGraph* Graph = FindGraphByName(Blueprint, GraphName);
+		if (!Graph)
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("    breakLinks: graph '%s' not found"), *GraphName);
+			return false;
+		}
+		const FString NodeGuid = Op->GetStringField(TEXT("node"));
+		const FString PinName = Op->GetStringField(TEXT("pin"));
+		UEdGraphNode* Target = nullptr;
+		for (UEdGraphNode* N : Graph->Nodes)
+		{
+			if (N && N->NodeGuid.ToString(EGuidFormats::Digits) == NodeGuid) { Target = N; break; }
+		}
+		UEdGraphPin* Pin = nullptr;
+		if (Target)
+		{
+			for (UEdGraphPin* P : Target->Pins)
+			{
+				if (P && (P->PinName.ToString() == PinName || StripStructPinGuid(P->PinName.ToString()) == PinName)) { Pin = P; break; }
+			}
+		}
+		if (!Pin)
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("    breakLinks: pin '%s' not found on node '%s'"), *PinName, *NodeGuid);
+			return false;
+		}
+
+		TArray<UEdGraphPin*> Affected = Pin->LinkedTo;
+		Affected.Add(Pin);
+		const int32 NumLinks = Pin->LinkedTo.Num();
+		Pin->Modify();
+		Pin->BreakAllPinLinks();
+
+		int32 Removed = 0;
+		for (UEdGraphPin* P : Affected)
+		{
+			if (P && P->bOrphanedPin && P->LinkedTo.Num() == 0)
+			{
+				if (UEdGraphNode* Owner = P->GetOwningNodeUnchecked())
+				{
+					Owner->Modify();
+					Owner->RemovePin(P);
+					++Removed;
+				}
+			}
+		}
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+		UE_LOG(LogBlueprintOracle, Display, TEXT("    breakLinks '%s'.%s: %d link(s) broken, %d orphaned pin(s) removed"),
+			*NodeGuid, *PinName, NumLinks, Removed);
 		return true;
 	}
 

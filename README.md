@@ -90,7 +90,7 @@ UnrealEditor-Cmd.exe <Project>.uproject -run=BlueprintOracle -migrate -spec="<pa
 ```
 
 Ops include: `reparent`, `removeGraph`, `removeVar`, `replaceVarRefs`, `redirectCall`, `setCallPinDefault`,
-`addVar`, `removeNode`, `retargetVarRef`, `connectPins`, `retypeParam`, `spliceCall` (drive a pin from a
+`addVar`, `removeNode`, `retargetVarRef`, `connectPins`, `breakLinks`, `retypeParam`, `spliceCall` (drive a pin from a
 new call), and `buildBody` (author/extend a function body from a node+link spec — kinds `callFunction` /
 `breakStruct` / `makeStruct` / `callDelegate` / `cast` / `branch` / `variableGet`, with a replace or
 `append` mode). A separate `-settablefield` mode edits a DataTable row's field. **The full op reference,

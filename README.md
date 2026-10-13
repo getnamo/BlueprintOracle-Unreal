@@ -89,12 +89,19 @@ UnrealEditor-Cmd.exe <Project>.uproject -run=BlueprintOracle -migrate -spec="<pa
 ] } ] }
 ```
 
-Ops include: `reparent`, `removeGraph`, `removeVar`, `replaceVarRefs`, `redirectCall`, `setCallPinDefault`,
-`addVar`, `removeNode`, `retargetVarRef`, `connectPins`, `breakLinks`, `retypeParam`, `spliceCall` (drive a pin from a
-new call), and `buildBody` (author/extend a function body from a node+link spec — kinds `callFunction` /
-`breakStruct` / `makeStruct` / `callDelegate` / `cast` / `branch` / `variableGet`, with a replace or
-`append` mode). A separate `-settablefield` mode edits a DataTable row's field. **The full op reference,
-spec format, and the read→edit→verify workflow are in [`AGENTS.md`](AGENTS.md).**
+**Ops:**
+- **Editing:** `reparent`, `removeGraph`, `removeVar`, `replaceVarRefs`, `redirectCall`, `setCallPinDefault`, `addVar`, `removeNode`, `retargetVarRef`, `connectPins`, `breakLinks`, `retypeParam`, `spliceCall` (drive a pin from a new call).
+- **Components and defaults:** `addComponent`, `setComponentProperties`, `setDefaults` (class defaults), and `compile` (mid-spec).
+- **`buildBody`:** authors or extends a function body *or the EventGraph* from a node+link spec, with a replace or `append` mode.
+  - Kinds: `callFunction`, `breakStruct`, `makeStruct`, `callDelegate`, `cast`, `branch`, `variableGet` / `variableSet`, `event`, `componentEvent`, `customEvent`, `inputKey`, `switchString`, `sequence`, `self` and `comment`.
+  - Each node can set its `pos`; pin defaults can be text and assets.
+
+**Creating content:** an asset entry with `"create"` makes it instead of loading it, so a spec can generate whole example content (see TensorFlow-Unreal's `Tools/Examples`):
+- a Blueprint (then its ops run);
+- a render target;
+- a level with placed, configured actors.
+
+A separate `-settablefield` mode edits a DataTable row's field. **The full op reference, spec format, and the read→edit→verify workflow are in [`AGENTS.md`](AGENTS.md).**
 
 ### Verified editing API (UE 5.8)
 

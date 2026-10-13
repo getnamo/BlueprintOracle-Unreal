@@ -25,6 +25,7 @@ public class BlueprintOracle : ModuleRules
 				"BlueprintGraph",    // K2Node types
 				"ScriptDisassembler",// FKismetBytecodeDisassembler
 				"AssetRegistry",     // asset discovery
+				"InputCore",         // FKey (inputKey nodes)
 				"Json",
 				"JsonUtilities"
 			}

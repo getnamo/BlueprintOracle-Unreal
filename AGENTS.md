@@ -250,7 +250,11 @@ reports every asset's error/warning count without touching disk — always dry-r
 | `breakLinks` | `graph`, `node` (guid), `pin` | break every link of one pin; any pin left orphaned and unlinked (it or its former partners) is removed. Clears a stale wire from a changed signature (e.g. a delegate param that no longer exists) before `connectPins` wires the replacement. | — |
 | `connectPins` | `graph`, `from` (`{node,pin}`), `to` (`{node,pin}`) | connect two existing pins (exec or data), breaking the `to` pin's current links first. E.g. rewire exec flow to bypass a removed loop. | — |
 | `retypeParam` | `graph`, `param`, `category`, `struct?`/`class?`/`sub?`, `container?` | change a BP function's parameter type (FunctionEntry inputs / FunctionResult outputs editable pins) + `ReconstructNode`. **Changes the function signature** — the call sites' now-mismatched wires must be fixed (splice converters) in the same migration for a clean compile. | 4 |
-| `buildBody` | `graph`, `nodes[]`, `links[]`, `append?` | author a function body from a node+link spec (see §buildBody). Default **replaces** the body (keeps entry/result); `append:true` **adds to** the existing body. The general node-graph authoring op. | 2/4 |
+| `buildBody` | `graph`, `nodes[]`, `links[]`, `append?` | author a function body **or the `EventGraph`** from a node+link spec (see §buildBody). Default **replaces** the body (keeps a function's entry/result; an EventGraph is emptied, ghost events included); `append:true` **adds to** the existing body. The general node-graph authoring op. | 2/4 |
+| `addComponent` | `name`, `class`, `parent?`, `properties?` | add a component to the construction script (`name` = its variable). `parent` = a component variable to attach to (none = a root). `properties` set on the template (see §Property values). | — |
+| `setComponentProperties` | `component`, `properties` | set properties on a component template the Blueprint adds. | — |
+| `setDefaults` | `properties` | set class defaults (the CDO), e.g. `{"AutoReceiveInput": "Player0"}`; compiles first so the CDO is current. | — |
+| `compile` | — | compile mid-spec, so components/variables added by earlier ops are members that later ops (`variableGet`, `componentEvent`) can reference. | — |
 
 `graph?` (optional) restricts an op to one named graph; omit to apply across all graphs of the asset.
 
@@ -291,10 +295,22 @@ and strips the rest; append mode keeps the whole body and adds to it.
 | `callDelegate` | `delegate` (name), `defaults?` | call a multicast delegate (`SetFromProperty`, self-context). |
 | `cast` | `to` (class path) | a **pure** `DynamicCast`. Link the object in via `<id>:Object`, the result out via `<id>:result` (the awkward `As<Class>` pin name is aliased). For a C++ `AActor*`→BP-typed downcast. |
 | `branch` | — | a `K2Node_IfThenElse`. Pins: `execute` (in), `Condition` (in bool), `then` / `else` (out). |
-| `variableGet` | `var` (name) | a self-member `VariableGet`; **output pin is the variable name** (`<id>:ItemID`). |
+| `variableGet` / `variableSet` | `var` (name), `class?` | a member `VariableGet`/`VariableSet` (components are variables too); **the value pin is the variable name** (`<id>:ItemID`). With `class`, another object's member (target pin `self`). |
+| `event` | `member`, `class?` | override an inherited event, e.g. `ReceiveBeginPlay`, `ReceiveTick`. Exec out: `then`. |
+| `componentEvent` | `component`, `delegate` | a component's multicast delegate as an event (On … (Component)). Outputs: `then` + the delegate's params by name. Needs the component to be a member (`compile` after `addComponent`). |
+| `customEvent` | `name` | a custom event: callable by name, e.g. from `K2_SetTimer`'s `FunctionName`. Out: `then`. |
+| `inputKey` | `key` (an `EKeys` name: `N`, `SpaceBar`, `LeftMouseButton`, …) | a key event; outputs `Pressed`, `Released`, `Key`. The actor needs input (e.g. `setDefaults` `AutoReceiveInput`). |
+| `switchString` | `cases[]` | Switch on String: `execute` + `Selection` in; one exec out per case, named as the case, plus `Default`. |
+| `sequence` | `outputs?` (default 2) | execution sequence: `execute` in, `then_0`…`then_N-1` out. |
+| `self` | — | a Self node (out pin `self`). |
+| `comment` | `text`, `size` `[w, h]` | a comment box (not linkable). |
+
+**Per-node `pos`:** `[x, y]` (or `{x, y}`) places the node; without it nodes are stacked down the graph.
 
 **Per-node `defaults`:** `[{ "pin": "<name>", "value": "<literal>" }]` writes a pin's literal default (incl.
-struct literals like `(R=1.0,G=0.8,B=0.3,A=1.0)`), via the schema's `TrySetDefaultValue`.
+struct literals like `(R=1.0,G=0.8,B=0.3,A=1.0)` and enum names like `BLEND_Opaque`), via the schema's
+`TrySetDefaultValue`. Text pins take the string as text; object/class pins take an asset or class path
+(`/Engine/BasicShapes/Plane.Plane`, which must load).
 
 **Link refs** (`"nodeRef:pinName"`): node refs are `$entry`, `$result`, a spec `id`, or — **in `append`
 mode only** — an existing node's 32-char GUID (as emitted in `graph.json`), so you can wire an existing
@@ -306,6 +322,49 @@ pin/ref didn't resolve.
 `SomeFunctionMirrorIndex` + a `cast`). **Use append** to add behavior to a working graph without
 disturbing it (e.g. add an equipped-state indicator to a widget's `SetUI`: append `variableGet ItemID →
 breakStruct → branch(IsEquipped) → SetColorAndOpacity(self)`, wiring the existing tail node's `then` in).
+
+### Creating content (`"create"`)
+
+An asset entry with `"create"` makes the asset instead of loading it. The spec is the source of truth:
+re-running it regenerates the asset, and `-commit` overwrites the old file. Order the entries so referenced
+assets come first; they're in memory for the later entries even in a dry run.
+
+```jsonc
+{ "assets": [
+  { "package": "/MyPlugin/Examples/RT_Canvas",
+    "create": { "type": "renderTarget", "properties": { "SizeX": 256, "SizeY": 256, "RenderTargetFormat": "RTF_RGBA8" } } },
+  { "package": "/MyPlugin/Examples/BP_Demo",
+    "create": { "type": "blueprint", "parent": "/Script/Engine.Actor" },
+    "ops": [                                              // then the usual ops, against the new Blueprint
+      { "op": "addComponent", "name": "Root", "class": "/Script/Engine.SceneComponent" },
+      { "op": "addComponent", "name": "Label", "class": "/Script/Engine.TextRenderComponent", "parent": "Root",
+        "properties": { "Text": "INVTEXT(\"Hello\")", "RelativeLocation": "(X=0,Y=0,Z=100)" } },
+      { "op": "compile" },
+      { "op": "buildBody", "graph": "EventGraph", "nodes": [ ... ], "links": [ ... ] } ] },
+  { "package": "/MyPlugin/Examples/DemoMap",
+    "create": { "type": "level",
+      "worldSettings": { "DefaultGameMode": "/Script/Engine.GameModeBase" },
+      "actors": [
+        { "class": "/MyPlugin/Examples/BP_Demo.BP_Demo_C", "label": "Demo", "location": [0, 0, 0] },
+        { "class": "/Script/Engine.CameraActor", "location": [-600, 0, 150], "rotation": [0, 0, 0],   // pitch, yaw, roll
+          "properties": { "AutoActivateForPlayer": "Player0" } } ] } }
+] }
+```
+
+| `type` | fields | makes |
+|---|---|---|
+| `blueprint` | `parent` (class path) | a Blueprint; the entry's `ops` then run against it and it's compile-gated as usual |
+| `renderTarget` | `properties` | a `TextureRenderTarget2D` (default 256×256 RGBA8, black) |
+| `level` | `worldSettings?`, `actors[]` | a map (`.umap`): each actor has `class`, `label?`, `location?`, `rotation?`, `scale?` and `properties?` (dotted paths reach components, e.g. `"LightComponent.Intensity"`) |
+
+**Property values** (`properties` everywhere): Unreal's text form, the same as copy/paste in the details
+panel: `(X=1,Y=2,Z=3)`, `INVTEXT("text")`, an enum name (`Movable`, `Player0`), an asset path, or an array
+`("a","b")`. JSON numbers and booleans are converted. A dotted path follows object properties
+(`CameraComponent.FieldOfView`).
+
+A worked example that generates a Blueprint (9 components, a 42-node EventGraph), a render target and a map:
+TensorFlow-Unreal's `Tools/Examples/mnist_example.json`. To verify generated content beyond the compile gate,
+play it: re-extract with the read side, then run the map (PIE) in an automation test.
 
 **Ordering matters.** Do removals *before* a reparent so same-named C++ functions on the new parent
 don't collide with the BP graphs mid-apply; reparent last. Reads cleanest as: strip what C++ owns,

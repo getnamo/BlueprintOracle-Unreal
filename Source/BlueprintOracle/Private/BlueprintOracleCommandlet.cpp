@@ -27,6 +27,18 @@
 #include "K2Node_FunctionEntry.h"
 #include "K2Node_FunctionResult.h"
 #include "K2Node_EditablePinBase.h"
+#include "K2Node_ComponentBoundEvent.h"
+#include "K2Node_CustomEvent.h"
+#include "K2Node_ExecutionSequence.h"
+#include "K2Node_InputKey.h"
+#include "K2Node_Self.h"
+#include "K2Node_SwitchString.h"
+#include "K2Node_VariableSet.h"
+#include "EdGraphNode_Comment.h"
+#include "Engine/TextureRenderTarget2D.h"
+#include "Engine/World.h"
+#include "GameFramework/Actor.h"
+#include "GameFramework/WorldSettings.h"
 
 // Write-side (programmatic blueprint editing) APIs.
 #include "Kismet2/KismetEditorUtilities.h"
@@ -837,6 +849,227 @@ namespace
 		if (UEdGraph* G = Search(Blueprint->MacroGraphs)) { return G; }
 		return nullptr;
 	}
+
+	// A JSON value as the text Unreal's ImportText expects: strings as they are, numbers and bools spelled out.
+	FString JsonToPropertyText(const TSharedPtr<FJsonValue>& Value)
+	{
+		if (!Value.IsValid()) { return FString(); }
+		switch (Value->Type)
+		{
+		case EJson::Boolean: return Value->AsBool() ? TEXT("True") : TEXT("False");
+		case EJson::Number:
+		{
+			const double N = Value->AsNumber();
+			return FMath::IsNearlyEqual(N, FMath::RoundToDouble(N)) && FMath::Abs(N) < 1e15 ? FString::Printf(TEXT("%lld"), (int64)N) : FString::SanitizeFloat(N);
+		}
+		default: return Value->AsString();
+		}
+	}
+
+	// Set a property by dotted path ("LightComponent.Intensity": object properties are followed) from text,
+	// e.g. "(X=1,Y=2,Z=3)", "/Engine/BasicShapes/Plane.Plane", "Movable", INVTEXT("Hi").
+	bool SetPropertyByPath(UObject* Target, const FString& Path, const FString& Text)
+	{
+		TArray<FString> Parts;
+		Path.ParseIntoArray(Parts, TEXT("."));
+		UObject* Obj = Target;
+		for (int32 i = 0; Obj && i < Parts.Num(); ++i)
+		{
+			FProperty* Prop = FindFProperty<FProperty>(Obj->GetClass(), FName(*Parts[i]));
+			if (!Prop)
+			{
+				UE_LOG(LogBlueprintOracle, Error, TEXT("    property '%s' not found on %s (%s)"), *Parts[i], *Obj->GetName(), *Obj->GetClass()->GetName());
+				return false;
+			}
+			if (i < Parts.Num() - 1)
+			{
+				FObjectPropertyBase* ObjProp = CastField<FObjectPropertyBase>(Prop);
+				if (!ObjProp)
+				{
+					UE_LOG(LogBlueprintOracle, Error, TEXT("    '%s' in path '%s' is not an object property"), *Parts[i], *Path);
+					return false;
+				}
+				Obj = ObjProp->GetObjectPropertyValue_InContainer(Obj);
+				continue;
+			}
+			Obj->Modify();
+			if (!Prop->ImportText_InContainer(*Text, Obj, Obj, PPF_None))
+			{
+				UE_LOG(LogBlueprintOracle, Error, TEXT("    could not set %s = %s"), *Path, *Text);
+				return false;
+			}
+			FPropertyChangedEvent Changed(Prop);
+			Obj->PostEditChangeProperty(Changed);
+			return true;
+		}
+		UE_LOG(LogBlueprintOracle, Error, TEXT("    property path '%s' hit a null object"), *Path);
+		return false;
+	}
+
+	// "properties": { "Path": value, ... } onto an object.
+	bool SetPropertiesFromJson(UObject* Target, const TSharedPtr<FJsonObject>& Props)
+	{
+		if (!Props.IsValid()) { return true; }
+		bool bOk = true;
+		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Props->Values)
+		{
+			bOk &= SetPropertyByPath(Target, Pair.Key, JsonToPropertyText(Pair.Value));
+		}
+		return bOk;
+	}
+
+	// {x, y, z} / [x, y, z] -> vector; for rotations, (pitch, yaw, roll).
+	bool JsonToVector(const TSharedPtr<FJsonObject>& Obj, const FString& Field, FVector& Out)
+	{
+		const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+		if (Obj->TryGetArrayField(Field, Arr) && Arr->Num() == 3)
+		{
+			Out = FVector((*Arr)[0]->AsNumber(), (*Arr)[1]->AsNumber(), (*Arr)[2]->AsNumber());
+			return true;
+		}
+		return false;
+	}
+
+	// A fresh package for a generated asset. An asset of that name already in memory is moved aside (the spec
+	// is the source of truth: "create" regenerates the asset; saving overwrites the old file).
+	UPackage* FreshPackage(const FString& PackageName, FName& OutAssetName)
+	{
+		if (UPackage* Loaded = FindPackage(nullptr, *PackageName))
+		{
+			ResetLoaders(Loaded); //Release the old file so it can be overwritten
+		}
+		UPackage* Package = CreatePackage(*PackageName);
+		Package->MarkAsFullyLoaded(); //New content: otherwise an existing file makes it look partially loaded and unsaveable
+		OutAssetName = FName(*FPackageName::GetLongPackageAssetName(PackageName));
+		if (UObject* Existing = StaticFindObject(UObject::StaticClass(), Package, *OutAssetName.ToString()))
+		{
+			Existing->Rename(nullptr, GetTransientPackage(), REN_DontCreateRedirectors | REN_NonTransactional);
+		}
+		return Package;
+	}
+
+	// "create": {"type": "blueprint", "parent": "/Script/Engine.Actor"}
+	UBlueprint* CreateBlueprintAsset(const FString& PackageName, const TSharedPtr<FJsonObject>& Spec)
+	{
+		UClass* Parent = ResolveClass(Spec->GetStringField(TEXT("parent")));
+		if (!Parent || !FKismetEditorUtilities::CanCreateBlueprintOfClass(Parent))
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("  create: can't make a Blueprint of '%s'"), *Spec->GetStringField(TEXT("parent")));
+			return nullptr;
+		}
+		FName Name;
+		UPackage* Package = FreshPackage(PackageName, Name);
+		UBlueprint* Blueprint = FKismetEditorUtilities::CreateBlueprint(Parent, Package, Name, BPTYPE_Normal,
+			UBlueprint::StaticClass(), UBlueprintGeneratedClass::StaticClass(), NAME_None);
+		if (Blueprint)
+		{
+			FAssetRegistryModule::AssetCreated(Blueprint);
+			UE_LOG(LogBlueprintOracle, Display, TEXT("  created Blueprint %s (parent %s)"), *Name.ToString(), *Parent->GetName());
+		}
+		return Blueprint;
+	}
+
+	// "create": {"type": "renderTarget", "properties": {"SizeX": 256, "SizeY": 256, "RenderTargetFormat": "RTF_RGBA8", ...}}
+	// "create": {"type": "level", "worldSettings": {...}, "actors": [{"class", "label"?, "location"?, "rotation"?
+	//            (pitch, yaw, roll), "scale"?, "properties"?}]}
+	UObject* CreateOtherAsset(const FString& PackageName, const FString& Type, const TSharedPtr<FJsonObject>& Spec)
+	{
+		FName Name;
+		const TSharedPtr<FJsonObject>* Props = nullptr;
+		if (Type == TEXT("renderTarget"))
+		{
+			UPackage* Package = FreshPackage(PackageName, Name);
+			UTextureRenderTarget2D* RT = NewObject<UTextureRenderTarget2D>(Package, Name, RF_Public | RF_Standalone);
+			RT->RenderTargetFormat = RTF_RGBA8;
+			RT->ClearColor = FLinearColor::Black;
+			RT->SizeX = RT->SizeY = 256;
+			if (Spec->TryGetObjectField(TEXT("properties"), Props) && !SetPropertiesFromJson(RT, *Props))
+			{
+				return nullptr;
+			}
+			RT->UpdateResourceImmediate(true);
+			FAssetRegistryModule::AssetCreated(RT);
+			UE_LOG(LogBlueprintOracle, Display, TEXT("  created render target %s (%dx%d)"), *Name.ToString(), RT->SizeX, RT->SizeY);
+			return RT;
+		}
+		if (Type == TEXT("level"))
+		{
+			UPackage* Package = FreshPackage(PackageName, Name);
+			UWorld* World = UWorld::CreateWorld(EWorldType::Editor, /*bInformEngineOfWorld*/ false, Name, Package, /*bAddToRoot*/ true);
+			if (!World)
+			{
+				UE_LOG(LogBlueprintOracle, Error, TEXT("  create: could not create world %s"), *Name.ToString());
+				return nullptr;
+			}
+			World->SetFlags(RF_Public | RF_Standalone);
+			if (Spec->TryGetObjectField(TEXT("worldSettings"), Props) && !SetPropertiesFromJson(World->GetWorldSettings(), *Props))
+			{
+				return nullptr;
+			}
+			const TArray<TSharedPtr<FJsonValue>>* Actors = nullptr;
+			Spec->TryGetArrayField(TEXT("actors"), Actors);
+			int32 Spawned = 0;
+			for (const TSharedPtr<FJsonValue>& AV : Actors ? *Actors : TArray<TSharedPtr<FJsonValue>>())
+			{
+				const TSharedPtr<FJsonObject> A = AV->AsObject();
+				UClass* Cls = A.IsValid() ? ResolveClass(A->GetStringField(TEXT("class"))) : nullptr;
+				if (!Cls || !Cls->IsChildOf(AActor::StaticClass()))
+				{
+					UE_LOG(LogBlueprintOracle, Error, TEXT("  level: unknown actor class '%s'"), A.IsValid() ? *A->GetStringField(TEXT("class")) : TEXT("?"));
+					return nullptr;
+				}
+				FVector Location = FVector::ZeroVector, Rot = FVector::ZeroVector, Scale = FVector::OneVector;
+				JsonToVector(A, TEXT("location"), Location);
+				JsonToVector(A, TEXT("rotation"), Rot);
+				JsonToVector(A, TEXT("scale"), Scale);
+				const FRotator Rotation(Rot.X, Rot.Y, Rot.Z);
+				FActorSpawnParameters Params;
+				Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+				AActor* Actor = World->SpawnActor(Cls, &Location, &Rotation, Params);
+				if (!Actor)
+				{
+					UE_LOG(LogBlueprintOracle, Error, TEXT("  level: could not spawn %s"), *Cls->GetName());
+					return nullptr;
+				}
+				Actor->SetActorScale3D(Scale);
+				FString Label;
+				if (A->TryGetStringField(TEXT("label"), Label))
+				{
+					Actor->SetActorLabel(Label);
+				}
+				if (A->TryGetObjectField(TEXT("properties"), Props) && !SetPropertiesFromJson(Actor, *Props))
+				{
+					return nullptr;
+				}
+				++Spawned;
+			}
+			FAssetRegistryModule::AssetCreated(World);
+			UE_LOG(LogBlueprintOracle, Display, TEXT("  created level %s with %d actor(s)"), *Name.ToString(), Spawned);
+			return World;
+		}
+		UE_LOG(LogBlueprintOracle, Error, TEXT("  create: unknown type '%s' (blueprint, renderTarget, level)"), *Type);
+		return nullptr;
+	}
+
+	// {"x": .., "y": ..} or [x, y] -> node position.
+	bool JsonToPos(const TSharedPtr<FJsonObject>& Obj, int32& X, int32& Y)
+	{
+		const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+		if (Obj->TryGetArrayField(TEXT("pos"), Arr) && Arr->Num() == 2)
+		{
+			X = (int32)(*Arr)[0]->AsNumber();
+			Y = (int32)(*Arr)[1]->AsNumber();
+			return true;
+		}
+		const TSharedPtr<FJsonObject>* P = nullptr;
+		if (Obj->TryGetObjectField(TEXT("pos"), P))
+		{
+			X = (int32)(*P)->GetNumberField(TEXT("x"));
+			Y = (int32)(*P)->GetNumberField(TEXT("y"));
+			return true;
+		}
+		return false;
+	}
 }
 
 bool UBlueprintOracleCommandlet::ApplyMigrationOp(UBlueprint* Blueprint, const TSharedPtr<FJsonObject>& Op)
@@ -1021,6 +1254,96 @@ bool UBlueprintOracleCommandlet::ApplyMigrationOp(UBlueprint* Blueprint, const T
 		return true;
 	}
 
+	if (OpName == TEXT("addComponent"))
+	{
+		// Add a component to the Blueprint's construction script: name (its variable), class, parent
+		// (a component variable to attach to; none = a root), properties (set on the template).
+		USimpleConstructionScript* SCS = Blueprint->SimpleConstructionScript;
+		UClass* CompClass = ResolveClass(Op->GetStringField(TEXT("class")));
+		const FString Name = Op->GetStringField(TEXT("name"));
+		if (!SCS || !CompClass || !CompClass->IsChildOf(UActorComponent::StaticClass()))
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("    addComponent %s: %s"), *Name, !SCS ? TEXT("not an actor Blueprint") : TEXT("unknown component class"));
+			return false;
+		}
+		if (SCS->FindSCSNode(FName(*Name)))
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("    addComponent: '%s' already exists"), *Name);
+			return false;
+		}
+		USCS_Node* Node = SCS->CreateNode(CompClass, FName(*Name));
+		FString Parent;
+		if (Op->TryGetStringField(TEXT("parent"), Parent) && !Parent.IsEmpty())
+		{
+			USCS_Node* ParentNode = SCS->FindSCSNode(FName(*Parent));
+			if (!ParentNode)
+			{
+				UE_LOG(LogBlueprintOracle, Error, TEXT("    addComponent %s: parent '%s' not found"), *Name, *Parent);
+				return false;
+			}
+			ParentNode->AddChildNode(Node);
+		}
+		else
+		{
+			SCS->AddNode(Node);
+		}
+		const TSharedPtr<FJsonObject>* Props = nullptr;
+		if (Op->TryGetObjectField(TEXT("properties"), Props) && !SetPropertiesFromJson(Node->ComponentTemplate, *Props))
+		{
+			return false;
+		}
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+		UE_LOG(LogBlueprintOracle, Display, TEXT("    addComponent %s (%s)%s"), *Name, *CompClass->GetName(), Parent.IsEmpty() ? TEXT("") : *(TEXT(" under ") + Parent));
+		return true;
+	}
+
+	if (OpName == TEXT("setComponentProperties"))
+	{
+		// Set properties on a component template the Blueprint adds (its construction script).
+		const FString Name = Op->GetStringField(TEXT("component"));
+		USCS_Node* Node = Blueprint->SimpleConstructionScript ? Blueprint->SimpleConstructionScript->FindSCSNode(FName(*Name)) : nullptr;
+		const TSharedPtr<FJsonObject>* Props = nullptr;
+		if (!Node || !Op->TryGetObjectField(TEXT("properties"), Props))
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("    setComponentProperties: component '%s' not found (or no properties)"), *Name);
+			return false;
+		}
+		const bool bOk = SetPropertiesFromJson(Node->ComponentTemplate, *Props);
+		FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+		UE_LOG(LogBlueprintOracle, Display, TEXT("    setComponentProperties %s: %d"), *Name, (*Props)->Values.Num());
+		return bOk;
+	}
+
+	if (OpName == TEXT("setDefaults"))
+	{
+		// Class defaults (the CDO), e.g. AutoReceiveInput. Compiles first so the CDO is the current class's.
+		const TSharedPtr<FJsonObject>* Props = nullptr;
+		if (!Op->TryGetObjectField(TEXT("properties"), Props))
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("    setDefaults: no properties"));
+			return false;
+		}
+		FKismetEditorUtilities::CompileBlueprint(Blueprint, EBlueprintCompileOptions::SkipGarbageCollection);
+		UObject* CDO = Blueprint->GeneratedClass ? Blueprint->GeneratedClass->GetDefaultObject() : nullptr;
+		if (!CDO)
+		{
+			UE_LOG(LogBlueprintOracle, Error, TEXT("    setDefaults: no generated class"));
+			return false;
+		}
+		const bool bOk = SetPropertiesFromJson(CDO, *Props);
+		FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+		UE_LOG(LogBlueprintOracle, Display, TEXT("    setDefaults: %d"), (*Props)->Values.Num());
+		return bOk;
+	}
+
+	if (OpName == TEXT("compile"))
+	{
+		// Mid-spec compile: new components and variables become members later ops can reference.
+		FKismetEditorUtilities::CompileBlueprint(Blueprint, EBlueprintCompileOptions::SkipGarbageCollection);
+		UE_LOG(LogBlueprintOracle, Display, TEXT("    compile (mid-spec): status %d"), (int32)Blueprint->Status);
+		return true;
+	}
+
 	if (OpName == TEXT("buildBody"))
 	{
 		// Replace a function graph's body. Keeps the FunctionEntry/Result, removes every
@@ -1079,6 +1402,7 @@ bool UBlueprintOracleCommandlet::ApplyMigrationOp(UBlueprint* Blueprint, const T
 		const TArray<TSharedPtr<FJsonValue>>* NodeSpecs = nullptr;
 		Op->TryGetArrayField(TEXT("nodes"), NodeSpecs);
 		int32 PosY = 0;
+		int32 NodesCreated = 0;
 		if (NodeSpecs)
 		{
 			for (const TSharedPtr<FJsonValue>& NV : *NodeSpecs)
@@ -1155,15 +1479,151 @@ bool UBlueprintOracleCommandlet::ApplyMigrationOp(UBlueprint* Blueprint, const T
 					C.Finalize();
 					Created = Node;
 				}
-				else if (Kind == TEXT("variableGet"))
+				else if (Kind == TEXT("variableGet") || Kind == TEXT("variableSet"))
 				{
-					// Read a member variable (self). Output pin is named after the variable, e.g.
-					// {"kind":"variableGet","var":"ItemID"} -> link "<id>:ItemID".
-					FGraphNodeCreator<UK2Node_VariableGet> C(*Graph);
-					UK2Node_VariableGet* Node = C.CreateNode();
-					Node->VariableReference.SetSelfMember(FName(*NObj->GetStringField(TEXT("var"))));
+					// Read/write a member variable (components included). Self by default; "class" makes it
+					// another object's member (target pin "self"). The value pin is named after the variable,
+					// e.g. {"kind":"variableGet","var":"ItemID"} -> link "<id>:ItemID".
+					const FName Var(*NObj->GetStringField(TEXT("var")));
+					FString ClassPath;
+					NObj->TryGetStringField(TEXT("class"), ClassPath);
+					UClass* Owner = ClassPath.IsEmpty() ? nullptr : ResolveClass(ClassPath);
+					if (Kind == TEXT("variableGet"))
+					{
+						FGraphNodeCreator<UK2Node_VariableGet> C(*Graph);
+						UK2Node_VariableGet* Node = C.CreateNode();
+						Owner ? Node->VariableReference.SetExternalMember(Var, Owner) : Node->VariableReference.SetSelfMember(Var);
+						Node->NodePosX = 100; Node->NodePosY = PosY;
+						C.Finalize();
+						Created = Node;
+					}
+					else
+					{
+						FGraphNodeCreator<UK2Node_VariableSet> C(*Graph);
+						UK2Node_VariableSet* Node = C.CreateNode();
+						Owner ? Node->VariableReference.SetExternalMember(Var, Owner) : Node->VariableReference.SetSelfMember(Var);
+						Node->NodePosX = 300; Node->NodePosY = PosY;
+						C.Finalize();
+						Created = Node;
+					}
+				}
+				else if (Kind == TEXT("event"))
+				{
+					// Override an inherited event, e.g. {"kind":"event","member":"ReceiveBeginPlay"}. Exec out: "then".
+					const FName Member(*NObj->GetStringField(TEXT("member")));
+					FString ClassPath;
+					NObj->TryGetStringField(TEXT("class"), ClassPath);
+					UClass* Search = ClassPath.IsEmpty() ? Blueprint->ParentClass.Get() : ResolveClass(ClassPath);
+					UFunction* Fn = Search ? Search->FindFunctionByName(Member) : nullptr;
+					if (!Fn)
+					{
+						UE_LOG(LogBlueprintOracle, Error, TEXT("    buildBody: event '%s' not found"), *Member.ToString());
+						return false;
+					}
+					FGraphNodeCreator<UK2Node_Event> C(*Graph);
+					UK2Node_Event* Node = C.CreateNode();
+					Node->EventReference.SetExternalMember(Member, Fn->GetOwnerClass());
+					Node->bOverrideFunction = true;
+					Node->NodePosX = 0; Node->NodePosY = PosY;
+					C.Finalize();
+					Created = Node;
+				}
+				else if (Kind == TEXT("componentEvent"))
+				{
+					// A component's multicast delegate as an event, e.g. {"kind":"componentEvent",
+					// "component":"TensorFlow","delegate":"OnCustomEvent"}. Outputs: "then" + the delegate's params.
+					// The component must be a member already (addComponent, then a "compile" op).
+					const FName CompName(*NObj->GetStringField(TEXT("component")));
+					const FName DelegateName(*NObj->GetStringField(TEXT("delegate")));
+					FObjectProperty* CompProp = FindFProperty<FObjectProperty>(SkelClass, CompName);
+					FMulticastDelegateProperty* DelegateProp = CompProp && CompProp->PropertyClass
+						? FindFProperty<FMulticastDelegateProperty>(CompProp->PropertyClass, DelegateName) : nullptr;
+					if (!CompProp || !DelegateProp)
+					{
+						UE_LOG(LogBlueprintOracle, Error, TEXT("    buildBody: %s.%s not found (compile after addComponent?)"), *CompName.ToString(), *DelegateName.ToString());
+						return false;
+					}
+					FGraphNodeCreator<UK2Node_ComponentBoundEvent> C(*Graph);
+					UK2Node_ComponentBoundEvent* Node = C.CreateNode();
+					Node->InitializeComponentBoundEventParams(CompProp, DelegateProp);
+					Node->NodePosX = 0; Node->NodePosY = PosY;
+					C.Finalize();
+					Created = Node;
+				}
+				else if (Kind == TEXT("customEvent"))
+				{
+					// A custom event (callable as a function, and by name from timers): {"kind":"customEvent","name":"Next"}.
+					FGraphNodeCreator<UK2Node_CustomEvent> C(*Graph);
+					UK2Node_CustomEvent* Node = C.CreateNode();
+					Node->CustomFunctionName = FName(*NObj->GetStringField(TEXT("name")));
+					Node->NodePosX = 0; Node->NodePosY = PosY;
+					C.Finalize();
+					Created = Node;
+				}
+				else if (Kind == TEXT("inputKey"))
+				{
+					// A key event (the actor needs input, e.g. AutoReceiveInput): {"kind":"inputKey","key":"SpaceBar"}.
+					// Outputs: "Pressed", "Released", "Key".
+					FGraphNodeCreator<UK2Node_InputKey> C(*Graph);
+					UK2Node_InputKey* Node = C.CreateNode();
+					Node->InputKey = FKey(FName(*NObj->GetStringField(TEXT("key"))));
+					Node->NodePosX = 0; Node->NodePosY = PosY;
+					C.Finalize();
+					Created = Node;
+				}
+				else if (Kind == TEXT("switchString"))
+				{
+					// Switch on String: "Selection" in; one exec out per case (named as the case) plus "Default".
+					const TArray<TSharedPtr<FJsonValue>>* Cases = nullptr;
+					FGraphNodeCreator<UK2Node_SwitchString> C(*Graph);
+					UK2Node_SwitchString* Node = C.CreateNode();
+					if (NObj->TryGetArrayField(TEXT("cases"), Cases))
+					{
+						for (const TSharedPtr<FJsonValue>& Case : *Cases)
+						{
+							Node->PinNames.Add(FName(*Case->AsString()));
+						}
+					}
+					Node->NodePosX = 300; Node->NodePosY = PosY;
+					C.Finalize();
+					Created = Node;
+				}
+				else if (Kind == TEXT("sequence"))
+				{
+					// Execution sequence: "execute" in, "then_0".."then_N-1" out ("outputs", default 2).
+					FGraphNodeCreator<UK2Node_ExecutionSequence> C(*Graph);
+					UK2Node_ExecutionSequence* Node = C.CreateNode();
+					Node->NodePosX = 300; Node->NodePosY = PosY;
+					C.Finalize();
+					const int32 Outputs = NObj->HasField(TEXT("outputs")) ? (int32)NObj->GetNumberField(TEXT("outputs")) : 2;
+					for (int32 i = 2; i < Outputs; ++i)
+					{
+						Node->AddInputPin();
+					}
+					Created = Node;
+				}
+				else if (Kind == TEXT("self"))
+				{
+					FGraphNodeCreator<UK2Node_Self> C(*Graph);
+					UK2Node_Self* Node = C.CreateNode();
 					Node->NodePosX = 100; Node->NodePosY = PosY;
 					C.Finalize();
+					Created = Node;
+				}
+				else if (Kind == TEXT("comment"))
+				{
+					// A comment box: "text", "pos", "size" [w, h]. Not linkable.
+					UEdGraphNode_Comment* Node = NewObject<UEdGraphNode_Comment>(Graph);
+					Node->CreateNewGuid();
+					Node->NodeComment = NObj->GetStringField(TEXT("text"));
+					const TArray<TSharedPtr<FJsonValue>>* Size = nullptr;
+					if (NObj->TryGetArrayField(TEXT("size"), Size) && Size->Num() == 2)
+					{
+						Node->NodeWidth = (int32)(*Size)[0]->AsNumber();
+						Node->NodeHeight = (int32)(*Size)[1]->AsNumber();
+					}
+					Node->NodePosX = 0; Node->NodePosY = PosY;
+					Graph->AddNode(Node, /*bFromUI*/ false, /*bSelectNewNode*/ false);
 					Created = Node;
 				}
 				else if (Kind == TEXT("branch"))
@@ -1213,7 +1673,25 @@ bool UBlueprintOracleCommandlet::ApplyMigrationOp(UBlueprint* Blueprint, const T
 						const FString Value = DObj->GetStringField(TEXT("value"));
 						if (UEdGraphPin* Pin = Created->FindPin(FName(*PinName), EGPD_Input))
 						{
-							if (const UEdGraphSchema* Schema = Pin->GetSchema())
+							const UEdGraphSchema* Schema = Pin->GetSchema();
+							const FName Category = Pin->PinType.PinCategory;
+							if (Schema && Category == UEdGraphSchema_K2::PC_Text)
+							{
+								Schema->TrySetDefaultText(*Pin, FText::FromString(Value));
+							}
+							else if (Schema && (Category == UEdGraphSchema_K2::PC_Object || Category == UEdGraphSchema_K2::PC_Class
+								|| Category == UEdGraphSchema_K2::PC_SoftObject || Category == UEdGraphSchema_K2::PC_SoftClass))
+							{
+								// An asset or class by path, e.g. "/Engine/BasicShapes/Plane.Plane"
+								UObject* Obj = LoadObject<UObject>(nullptr, *Value);
+								if (!Obj)
+								{
+									UE_LOG(LogBlueprintOracle, Error, TEXT("    buildBody: '%s' for pin %s on node '%s' doesn't load"), *Value, *PinName, *Id);
+									return false;
+								}
+								Schema->TrySetDefaultObject(*Pin, Obj);
+							}
+							else if (Schema)
 							{
 								Schema->TrySetDefaultValue(*Pin, Value);
 							}
@@ -1230,7 +1708,14 @@ bool UBlueprintOracleCommandlet::ApplyMigrationOp(UBlueprint* Blueprint, const T
 					}
 				}
 
+				int32 PosXOverride = 0, PosYOverride = 0;
+				if (Created && JsonToPos(NObj, PosXOverride, PosYOverride))
+				{
+					Created->NodePosX = PosXOverride;
+					Created->NodePosY = PosYOverride;
+				}
 				NodeMap.Add(Id, Created);
+				++NodesCreated;
 				PosY += 200;
 			}
 		}
@@ -1261,7 +1746,7 @@ bool UBlueprintOracleCommandlet::ApplyMigrationOp(UBlueprint* Blueprint, const T
 
 		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 		UE_LOG(LogBlueprintOracle, Display, TEXT("    buildBody '%s': %d node(s), %d link(s) ok, %d failed"),
-			*GraphName, NodeMap.Num() - 2, LinkOk, LinkFail);
+			*GraphName, NodesCreated, LinkOk, LinkFail);
 		return LinkFail == 0;
 	}
 
@@ -1700,17 +2185,78 @@ int32 UBlueprintOracleCommandlet::RunMigration(const FString& SpecPath, bool bCo
 		const FString PackageName = AssetObj->GetStringField(TEXT("package"));
 		UE_LOG(LogBlueprintOracle, Display, TEXT("--- %s ---"), *PackageName);
 
-		UPackage* Package = LoadPackage(nullptr, *PackageName, LOAD_None);
-		if (!Package)
-		{
-			UE_LOG(LogBlueprintOracle, Error, TEXT("  could not load package"));
-			++FailedAssets;
-			continue;
-		}
-		Package->FullyLoad();
-
+		UPackage* Package = nullptr;
 		UBlueprint* Blueprint = nullptr;
+		const TSharedPtr<FJsonObject>* CreateSpec = nullptr;
+		if (AssetObj->TryGetObjectField(TEXT("create"), CreateSpec))
 		{
+			// Generated assets: a Blueprint continues to its ops; anything else is created and saved here.
+			const FString Type = (*CreateSpec)->GetStringField(TEXT("type"));
+			if (Type == TEXT("blueprint"))
+			{
+				Blueprint = CreateBlueprintAsset(PackageName, *CreateSpec);
+				if (!Blueprint)
+				{
+					++FailedAssets;
+					continue;
+				}
+				Package = Blueprint->GetOutermost();
+			}
+			else
+			{
+				UObject* Asset = CreateOtherAsset(PackageName, Type, *CreateSpec);
+				if (!Asset)
+				{
+					++FailedAssets;
+					continue;
+				}
+				UWorld* World = Cast<UWorld>(Asset);
+				if (bCommit)
+				{
+					UPackage* AssetPackage = Asset->GetOutermost();
+					AssetPackage->MarkPackageDirty();
+					const FString FileName = FPackageName::LongPackageNameToFilename(AssetPackage->GetName(),
+						World ? FPackageName::GetMapPackageExtension() : FPackageName::GetAssetPackageExtension());
+					FPlatformFileManager::Get().GetPlatformFile().SetReadOnly(*FileName, false);
+					FSavePackageArgs SaveArgs;
+					SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+					SaveArgs.SaveFlags = SAVE_NoError;
+					const FSavePackageResultStruct Saved = UPackage::Save(AssetPackage, Asset, *FileName, SaveArgs);
+					if (Saved.IsSuccessful())
+					{
+						UE_LOG(LogBlueprintOracle, Display, TEXT("  SAVED %s"), *FileName);
+						++SavedAssets;
+					}
+					else
+					{
+						UE_LOG(LogBlueprintOracle, Error, TEXT("  SAVE FAILED %s (result %d)"), *FileName, (int32)Saved.Result);
+						++FailedAssets;
+					}
+				}
+				else
+				{
+					UE_LOG(LogBlueprintOracle, Display, TEXT("  dry-run: created (not saved)"));
+				}
+				if (World)
+				{
+					//Its subsystems are initialized: tear it down properly rather than leaving it to exit
+					World->DestroyWorld(/*bInformEngineOfWorld*/ false);
+					World->RemoveFromRoot();
+				}
+				continue;
+			}
+		}
+		else
+		{
+			Package = LoadPackage(nullptr, *PackageName, LOAD_None);
+			if (!Package)
+			{
+				UE_LOG(LogBlueprintOracle, Error, TEXT("  could not load package"));
+				++FailedAssets;
+				continue;
+			}
+			Package->FullyLoad();
+
 			TArray<UObject*> Objects;
 			GetObjectsWithOuter(Package, Objects, EGetObjectsFlags::None);
 			for (UObject* Obj : Objects)
@@ -1791,7 +2337,7 @@ int32 UBlueprintOracleCommandlet::RunMigration(const FString& SpecPath, bool bCo
 			}
 			else
 			{
-				UE_LOG(LogBlueprintOracle, Error, TEXT("  SAVE FAILED %s"), *FileName);
+				UE_LOG(LogBlueprintOracle, Error, TEXT("  SAVE FAILED %s (result %d)"), *FileName, (int32)Result.Result);
 				++FailedAssets;
 			}
 		}

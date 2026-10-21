@@ -1,7 +1,7 @@
 # BlueprintOracle-Unreal
 
 An Unreal Engine editor commandlet that dumps **ground-truth Blueprint data to JSON/text** for static
-analysis, documentation, and **agent-assisted Blueprint-to-C++ conversion**.
+analysis, documentation, and **agent-assisted Blueprint-to-C++ conversion and direct Blueprint Editing**.
 
 Blueprints are binary visual graphs, which are awkward to diff, review, or feed to an LLM. BlueprintOracle
 loads each Blueprint with the engine itself (so deserialization is always correct and version-accurate) and

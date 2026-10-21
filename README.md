@@ -135,7 +135,7 @@ wired call from `Abs` to `Sqrt` and confirming the input wire survives.
 
 ## Install
 
-Requires **UE 5.8+**. Drop into your project's `Plugins/` folder (or add as a submodule) and enable it for the Editor target.
+Latest Requires **UE 5.8+**, but earlier versions work on e.g. UE5.5. Drop into your project's `Plugins/` folder (or add as a submodule) and enable it for the Editor target.
 It depends only on engine modules (`UnrealEd`, `Kismet`, `BlueprintGraph`, `ScriptDisassembler`,
 `AssetRegistry`, `Json`).
 
